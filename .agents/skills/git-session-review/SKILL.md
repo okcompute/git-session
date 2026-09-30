@@ -243,6 +243,15 @@ Every PR that changes application code (`src/`, `build.zig`,
 When reviewing, if the PR touches application code and `CHANGELOG.md`
 is not updated, flag it as a required change, not a suggestion.
 
+## Release and installer contract
+
+`.github/workflows/release.yml`, `install.sh`, and `docs/installation.md`
+share an asset-name contract: `git-session-<target>.tar.gz` for each
+target, plus a `SHA256SUMS` file. If a change renames an asset or
+adds/removes a target, verify all three stay in sync — a mismatch
+silently breaks the installer (the download 404s and it falls back to a
+source build).
+
 ## Linting
 
 This project uses [zlint](https://github.com/DonIsaac/zlint) for static

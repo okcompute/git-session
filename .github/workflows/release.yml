@@ -1,0 +1,73 @@
+name: Release
+
+# Publishes a GitHub Release with prebuilt binaries when an official
+# version tag (e.g. v1.0.0) is pushed. The release assets are served
+# through GitHub's CDN, so they can be fetched from:
+#   https://github.com/okcompute/git-session/releases/latest/download/<asset>
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux
+            os: ubuntu-latest
+          - target: aarch64-linux
+            os: ubuntu-latest
+          - target: aarch64-macos
+            os: macos-latest
+          - target: x86_64-macos
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The version embedded in the binary is taken from the tag name
+      # (v1.0.0 -> 1.0.0) so `git-session --version` matches the release.
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dversion=${GITHUB_REF_NAME#v}
+
+      - name: Package
+        run: tar -czf git-session-${{ matrix.target }}.tar.gz -C zig-out/bin git-session
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-session-${{ matrix.target }}
+          path: git-session-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: sha256sum git-session-*.tar.gz > SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            git-session-*.tar.gz SHA256SUMS

@@ -36,6 +36,10 @@ Changes that do NOT require a changelog entry:
 
 When creating commits or PRs, always verify that `CHANGELOG.md` has been updated if the change touches application code (`src/`, `build.zig`, `build.zig.zon`).
 
+## Releases
+
+Releases are cut by pushing a `v*` tag (e.g. `v1.0.0`); the `Release` workflow (`.github/workflows/release.yml`) builds prebuilt binaries for Linux and macOS and publishes them with a `SHA256SUMS` file. Keep the `build.zig.zon` version, the `CHANGELOG.md` section, and the tag in sync — the tag is embedded as the binary's `--version`, so a mismatch ships the wrong version string silently.
+
 ## Linting
 
 This project uses [zlint](https://github.com/DonIsaac/zlint) for static analysis. Agents must run `zlint` from the repository root before considering any code change complete. The configuration lives in `zlint.json`.
