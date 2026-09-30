@@ -10,7 +10,7 @@ When creating PRs:
 - Do not ask the user for a Jira ticket reference. Skip any Jira-related steps entirely.
 - PR title format: a short, descriptive summary of the changes.
 - PR description should contain a "Change details" section and a "PR Checklist" with at minimum a self-review checkbox.
-- Before creating a PR, run a code review using the `git-session-review` skill (located at `.agents/skills/git-session-review/`).
+- Before creating a PR, run a code review using the `git-session-code-review` skill (located at `.agents/skills/git-session-code-review/`).
 
 When checking if the branch needs to be pushed before creating a PR:
 - Do NOT rely solely on `git status` to determine if commits have been pushed. It can report "ahead" even when the remote is up to date if the local tracking ref is stale.
