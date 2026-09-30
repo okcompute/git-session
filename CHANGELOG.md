@@ -23,6 +23,8 @@ Initial public release.
 - New worktrees are based on the latest origin state of the selected base branch.
 - Automatic recovery of deleted bare repositories: if the bare repository, the repository folder, or an entire root folder is removed, git-session re-creates and re-clones from the recorded origin URL the next time the repository is opened.
 - Vanished repositories (on-disk folder deleted but central config still present) remain listed so recovery can be triggered through the normal CLI/TUI flows.
-- CLI reference (`docs/command-line.md`) and configuration reference (`docs/configuration.md`).
+- CLI reference (`docs/command-line.md`), configuration reference (`docs/configuration.md`), and installation guide (`docs/installation.md`).
+- Prebuilt release binaries for Linux and macOS, published as GitHub Release assets alongside a `SHA256SUMS` checksum file. Pushing a `v*` tag builds and publishes them through the `Release` workflow, and the assets are served via GitHub's CDN.
+- `install.sh` downloads the matching release binary by default (verifying its SHA-256 checksum) and falls back to building from source when no prebuilt binary is available. New options: `--version <tag>` to pick a release and `--from-source` to force a source build.
 
 [1.0.0]: https://github.com/okcompute/git-session/releases/tag/v1.0.0

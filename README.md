@@ -11,25 +11,28 @@ git-session handles:
 
 ## Requirements
 
-- [Zig](https://ziglang.org/) 0.16+
 - Git
-- TMUX
+- TMUX (>= 3.0)
+
+[Zig](https://ziglang.org/) 0.16+ is required only when building from source.
 
 ## Install
 
-Clone the repository and run the install script:
+Prebuilt binaries for Linux and macOS are published with each [release](https://github.com/okcompute/git-session/releases). The install script downloads the matching binary for your platform, verifies its checksum, and installs it to `~/.local/bin`:
 
 ```bash
-git clone https://github.com/okcompute/git-session.git
-cd git-session
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/okcompute/git-session/main/install.sh | bash
 ```
 
-The script checks that all prerequisites are present, builds the project, and installs the binary to `~/.local/bin`. To install to a different location:
+To install a specific version, choose a different prefix, or build from source:
 
 ```bash
-./install.sh --prefix ~       # installs to ~/bin
+./install.sh --version v1.0.0    # a specific release
+./install.sh --prefix ~          # installs to ~/bin
+./install.sh --from-source       # build from source (requires Zig 0.16+)
 ```
+
+See [docs/installation.md](docs/installation.md) for manual installation and the list of release assets.
 
 ## Quick Start
 
@@ -213,6 +216,10 @@ This project uses a [CHANGELOG.md](CHANGELOG.md) following the [Keep a Changelog
 ### CI
 
 A GitHub Actions workflow runs on every push to `main` and on pull requests. It builds the project, runs all tests, runs zlint, and verifies the release binary on both Linux and macOS.
+
+### Releases
+
+Pushing a version tag (e.g. `v1.0.0`) triggers the `Release` workflow, which builds release binaries for Linux and macOS, attaches them to a GitHub Release together with `SHA256SUMS`, and serves them through GitHub's CDN. The version embedded in the binary is taken from the tag, so `git-session --version` matches the release.
 
 ## License
 

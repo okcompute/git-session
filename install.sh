@@ -3,21 +3,28 @@
 # git-session installer
 #
 # Usage:
-#   ./install.sh              # Build and install to ~/.local/bin
-#   ./install.sh --prefix ~   # Install to ~/bin
-#   ./install.sh --help       # Show usage
+#   ./install.sh                    # install the latest release to ~/.local/bin
+#   ./install.sh --prefix ~         # install to ~/bin
+#   ./install.sh --version v1.0.0   # install a specific release
+#   ./install.sh --from-source      # build from source instead of downloading
+#   ./install.sh --help             # show usage
 #
-# This script:
-#   1. Checks that required tools are present (Zig 0.16+, Git, tmux)
-#   2. Builds git-session from source
-#   3. Installs the binary to PREFIX/bin
+# By default the installer downloads the prebuilt binary for the current
+# platform from GitHub Releases, verifies its SHA-256 checksum against the
+# release's SHA256SUMS file, and installs it to PREFIX/bin.
 #
+# If the platform has no prebuilt binary, the download fails, or
+# --from-source is given, the installer falls back to building from source
+# (which requires Zig 0.16+ and must be run from the repository root).
 
 set -euo pipefail
 
 # --- Defaults ---
 PREFIX="$HOME/.local"
 BINARY_NAME="git-session"
+REPO="okcompute/git-session"
+VERSION="latest"
+FROM_SOURCE=0
 
 # --- Colors (disabled if not a terminal) ---
 if [ -t 1 ]; then
@@ -42,16 +49,23 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Install git-session from source.
+Install git-session.
+
+By default the prebuilt binary for this platform is downloaded from GitHub
+Releases and installed to PREFIX/bin. Use --from-source to build instead.
 
 Options:
-  --prefix DIR    Installation prefix (default: ~/.local)
-                  Binary is placed in DIR/bin/
-  --help          Show this help message
+  --prefix DIR     Installation prefix (default: ~/.local)
+                   Binary is placed in DIR/bin/
+  --version VER    Release to install: "latest" (default) or a tag such as v1.0.0
+  --from-source    Build from source instead of downloading a release
+  --help           Show this help message
 
 Examples:
-  ./install.sh                    # Install to ~/.local/bin
-  ./install.sh --prefix ~/.local  # Install to ~/.local/bin
+  ./install.sh                    # Install the latest release to ~/.local/bin
+  ./install.sh --prefix ~         # Install to ~/bin
+  ./install.sh --version v1.0.0   # Install a specific release
+  ./install.sh --from-source      # Build from source
 EOF
     exit 0
 }
@@ -68,6 +82,19 @@ while [ $# -gt 0 ]; do
             PREFIX="${1#--prefix=}"
             shift
             ;;
+        --version)
+            [ $# -ge 2 ] || die "--version requires an argument"
+            VERSION="$2"
+            shift 2
+            ;;
+        --version=*)
+            VERSION="${1#--version=}"
+            shift
+            ;;
+        --from-source)
+            FROM_SOURCE=1
+            shift
+            ;;
         --help|-h)
             usage
             ;;
@@ -81,92 +108,223 @@ done
 PREFIX="${PREFIX/#\~/$HOME}"
 INSTALL_DIR="$PREFIX/bin"
 
+# Normalize a bare version (1.0.0) to its tag (v1.0.0)
+if [ "$VERSION" != "latest" ] && [ "${VERSION#v}" = "$VERSION" ]; then
+    VERSION="v${VERSION}"
+fi
+
 # --- Refuse to run as root ---
 if [ "$(id -u)" -eq 0 ]; then
     die "Do not run this script as root or with sudo. It installs to ~/.local/bin by default, which does not require elevated privileges."
 fi
 
-# --- Prerequisite checks ---
-info "Checking prerequisites..."
+# --- Download helper ---
+download() {
+    # download <url> <dest>
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$2" "$1"
+    else
+        return 1
+    fi
+}
 
-MISSING=0
+sha256_of() {
+    # sha256_of <file> -> hex digest on stdout
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
 
-# Check Zig
-if ! command -v zig &>/dev/null; then
-    error "zig is not installed."
-    printf "  Install it from: https://ziglang.org/download/\n" >&2
-    MISSING=1
-else
+detect_target() {
+    # Maps the host to a release asset target, e.g. aarch64-macos.
+    local os arch
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    case "$os" in
+        Linux)  os="linux" ;;
+        Darwin) os="macos" ;;
+        *) return 1 ;;
+    esac
+    case "$arch" in
+        x86_64|amd64)  arch="x86_64" ;;
+        arm64|aarch64) arch="aarch64" ;;
+        *) return 1 ;;
+    esac
+    printf '%s-%s' "$arch" "$os"
+}
+
+# --- Check runtime prerequisites (git, tmux) ---
+check_runtime_deps() {
+    info "Checking prerequisites..."
+
+    MISSING=0
+
+    if ! command -v git >/dev/null 2>&1; then
+        error "git is not installed."
+        printf "  Install it from: https://git-scm.com/\n" >&2
+        MISSING=1
+    else
+        ok "git $(git --version | awk '{print $3}')"
+    fi
+
+    if ! command -v tmux >/dev/null 2>&1; then
+        error "tmux is not installed."
+        printf "  Install it from: https://github.com/tmux/tmux\n" >&2
+        MISSING=1
+    else
+        ok "tmux $(tmux -V | awk '{print $2}')"
+    fi
+
+    [ "$MISSING" -eq 0 ] || die "Missing prerequisites. Install the tools listed above and try again."
+}
+
+# --- Install from a GitHub release ---
+install_prebuilt() {
+    local target
+    if ! target="$(detect_target)"; then
+        warn "No prebuilt binary for this platform ($(uname -s)/$(uname -m))."
+        return 1
+    fi
+
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        warn "Neither curl nor wget is available to download the release."
+        return 1
+    fi
+
+    local base asset tmp
+    if [ "$VERSION" = "latest" ]; then
+        base="https://github.com/${REPO}/releases/latest/download"
+    else
+        base="https://github.com/${REPO}/releases/download/${VERSION}"
+    fi
+    asset="git-session-${target}.tar.gz"
+
+    tmp="$(mktemp -d)"
+    if [ ! -d "$tmp" ]; then
+        warn "Could not create a temporary directory."
+        return 1
+    fi
+
+    info "Downloading ${asset} (${VERSION})..."
+    if ! download "${base}/${asset}" "${tmp}/${asset}"; then
+        warn "Download failed: ${base}/${asset}"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    # Verify the SHA-256 checksum when the release provides SHA256SUMS.
+    if download "${base}/SHA256SUMS" "${tmp}/SHA256SUMS" 2>/dev/null; then
+        local expected actual
+        expected="$(awk -v f="$asset" '$2 == f { print $1 }' "${tmp}/SHA256SUMS" | head -n1)"
+        if [ -n "$expected" ]; then
+            if actual="$(sha256_of "${tmp}/${asset}")"; then
+                if [ "$expected" != "$actual" ]; then
+                    error "Checksum mismatch for ${asset}"
+                    printf "  expected %s\n  got      %s\n" "$expected" "$actual" >&2
+                    rm -rf "$tmp"
+                    return 1
+                fi
+                ok "Checksum verified"
+            else
+                warn "No sha256 tool available; skipping checksum verification."
+            fi
+        fi
+    else
+        warn "Could not download SHA256SUMS; skipping checksum verification."
+    fi
+
+    info "Installing to $INSTALL_DIR..."
+    mkdir -p "$INSTALL_DIR" || { error "Cannot create $INSTALL_DIR"; rm -rf "$tmp"; return 1; }
+
+    if ! tar -xzf "${tmp}/${asset}" -C "$tmp" "$BINARY_NAME"; then
+        warn "Failed to extract ${asset}."
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    cp "${tmp}/${BINARY_NAME}" "$INSTALL_DIR/$BINARY_NAME" || {
+        error "Cannot copy to $INSTALL_DIR/$BINARY_NAME"
+        rm -rf "$tmp"
+        return 1
+    }
+    chmod +x "$INSTALL_DIR/$BINARY_NAME"
+    rm -rf "$tmp"
+
+    ok "Installed $BINARY_NAME to $INSTALL_DIR/$BINARY_NAME"
+    return 0
+}
+
+# --- Build from source ---
+build_from_source() {
+    info "Building from source..."
+
+    if ! command -v zig >/dev/null 2>&1; then
+        error "zig is not installed (required to build from source)."
+        printf "  Install it from: https://ziglang.org/download/\n" >&2
+        die "Cannot build from source without Zig 0.16+."
+    fi
+
     ZIG_VERSION=$(zig version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || echo "0.0.0")
     ZIG_MAJOR=$(echo "$ZIG_VERSION" | cut -d. -f1)
     ZIG_MINOR=$(echo "$ZIG_VERSION" | cut -d. -f2)
-
     if [ "$ZIG_MAJOR" -eq 0 ] && [ "$ZIG_MINOR" -lt 16 ]; then
         error "Zig 0.16+ is required (found $ZIG_VERSION)"
         printf "  Update from: https://ziglang.org/download/\n" >&2
-        MISSING=1
-    else
-        ok "zig $ZIG_VERSION"
+        die "Cannot build from source with an older Zig."
     fi
-fi
+    ok "zig $ZIG_VERSION"
 
-# Check Git
-if ! command -v git &>/dev/null; then
-    error "git is not installed."
-    printf "  Install it from: https://git-scm.com/\n" >&2
-    MISSING=1
-else
-    ok "git $(git --version | awk '{print $3}')"
-fi
+    if [ ! -f "build.zig" ] || [ ! -f "src/main.zig" ]; then
+        die "This script must be run from the git-session repository root to build from source."
+    fi
 
-# Check tmux
-if ! command -v tmux &>/dev/null; then
-    error "tmux is not installed."
-    printf "  Install it from: https://github.com/tmux/tmux\n" >&2
-    MISSING=1
-else
-    ok "tmux $(tmux -V | awk '{print $2}')"
-fi
+    info "Building git-session..."
+    if ! zig build -Doptimize=ReleaseSafe; then
+        die "Build failed. Check the output above for errors."
+    fi
+    ok "Build complete"
 
-[ "$MISSING" -eq 0 ] || die "Missing prerequisites. Install the tools listed above and try again."
+    local build_output="zig-out/bin/$BINARY_NAME"
+    if [ ! -f "$build_output" ]; then
+        die "Build output not found at $build_output"
+    fi
 
-# --- Verify we're in the right directory ---
-if [ ! -f "build.zig" ] || [ ! -f "src/main.zig" ]; then
-    die "This script must be run from the git-session repository root."
-fi
-
-# --- Build ---
-BUILD_OUTPUT="zig-out/bin/$BINARY_NAME"
-
-info "Building git-session..."
-if ! zig build -Doptimize=ReleaseSafe; then
-    die "Build failed. Check the output above for errors."
-fi
-ok "Build complete"
-
-# --- Install ---
-info "Installing to $INSTALL_DIR..."
-
-# Create bin directory if needed
-if [ ! -d "$INSTALL_DIR" ]; then
-    mkdir -p "$INSTALL_DIR" || {
-        error "Cannot create $INSTALL_DIR"
+    info "Installing to $INSTALL_DIR..."
+    mkdir -p "$INSTALL_DIR" || { error "Cannot create $INSTALL_DIR"; exit 1; }
+    cp "$build_output" "$INSTALL_DIR/$BINARY_NAME" || {
+        error "Cannot copy to $INSTALL_DIR/$BINARY_NAME"
         exit 1
     }
-fi
+    chmod +x "$INSTALL_DIR/$BINARY_NAME"
 
-if [ ! -f "$BUILD_OUTPUT" ]; then
-    die "Build output not found at $BUILD_OUTPUT"
-fi
-
-cp "$BUILD_OUTPUT" "$INSTALL_DIR/$BINARY_NAME" || {
-    error "Cannot copy to $INSTALL_DIR/$BINARY_NAME"
-    exit 1
+    ok "Installed $BINARY_NAME to $INSTALL_DIR/$BINARY_NAME"
 }
 
-chmod +x "$INSTALL_DIR/$BINARY_NAME"
+# --- Install ---
+check_runtime_deps
 
-ok "Installed $BINARY_NAME to $INSTALL_DIR/$BINARY_NAME"
+INSTALLED=0
+if [ "$FROM_SOURCE" -eq 0 ]; then
+    if install_prebuilt; then
+        INSTALLED=1
+    else
+        warn "Falling back to building from source."
+    fi
+fi
+if [ "$INSTALLED" -eq 0 ]; then
+    build_from_source
+fi
+
+# --- Verify the installed binary runs ---
+if ! "$INSTALL_DIR/$BINARY_NAME" --version >/dev/null 2>&1; then
+    warn "Installed binary did not run cleanly; check that it matches your platform."
+fi
 
 # --- Verify PATH ---
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
