@@ -1,5 +1,5 @@
 ---
-name: git-session-review
+name: git-session-code-review
 description: >
   Project-specific code review checklist for this Zig codebase (git-session).
   Focuses on idiomatic Zig patterns and test coverage expectations.
