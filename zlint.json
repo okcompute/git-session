@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/DonIsaac/zlint/refs/tags/v0.7.9/zlint.schema.json",
+  "ignore": ["zig-pkg"],
+  "rules": {
+    "homeless-try": "error",
+    "no-unresolved": "error",
+    "unused-decls": "warn",
+    "case-convention": "warn",
+    "empty-file": "warn",
+    "no-return-try": "off",
+    "suppressed-errors": "off",
+    "unsafe-undefined": "off"
+  }
+}
