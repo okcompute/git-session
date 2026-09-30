@@ -34,7 +34,9 @@ curl -fsSL https://raw.githubusercontent.com/okcompute/git-session/main/install.
 curl -fsSL https://raw.githubusercontent.com/okcompute/git-session/main/install.sh | bash -s -- --from-source
 ```
 
-You can also clone the repository and run `./install.sh` with the same options. If the platform has no prebuilt binary or the download fails, the script falls back to building from source.
+You can also clone the repository and run `./install.sh` with the same options. If the platform has no prebuilt binary, or no release is published yet, the script falls back to building from source. When run outside a repository checkout, `--from-source` clones the repository into a temporary directory before building.
+
+The download is verified against the release's `SHA256SUMS`; the installer refuses to install if the checksum does not match, if the asset is missing from `SHA256SUMS`, or if `SHA256SUMS` cannot be fetched.
 
 ## Manual install
 

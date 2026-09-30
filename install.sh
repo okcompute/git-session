@@ -206,54 +206,56 @@ install_prebuilt() {
     asset="git-session-${target}.tar.gz"
 
     tmp="$(mktemp -d)"
-    if [ ! -d "$tmp" ]; then
-        warn "Could not create a temporary directory."
-        return 1
-    fi
+    trap 'rm -rf "$tmp"' EXIT
 
     info "Downloading ${asset} (${VERSION})..."
     if ! download "${base}/${asset}" "${tmp}/${asset}"; then
-        warn "Download failed: ${base}/${asset}"
+        if [ "$VERSION" != "latest" ]; then
+            die "Release ${VERSION} does not provide ${asset}. Check that the tag exists and supports this platform."
+        fi
+        # No release published yet: fall back to a source build.
+        warn "No release asset available at ${base}/${asset}."
+        trap - EXIT
         rm -rf "$tmp"
         return 1
     fi
 
-    # Verify the SHA-256 checksum when the release provides SHA256SUMS.
-    if download "${base}/SHA256SUMS" "${tmp}/SHA256SUMS" 2>/dev/null; then
-        local expected actual
-        expected="$(awk -v f="$asset" '$2 == f { print $1 }' "${tmp}/SHA256SUMS" | head -n1)"
-        if [ -n "$expected" ]; then
-            if actual="$(sha256_of "${tmp}/${asset}")"; then
-                if [ "$expected" != "$actual" ]; then
-                    error "Checksum mismatch for ${asset}"
-                    printf "  expected %s\n  got      %s\n" "$expected" "$actual" >&2
-                    rm -rf "$tmp"
-                    return 1
-                fi
-                ok "Checksum verified"
-            else
-                warn "No sha256 tool available; skipping checksum verification."
-            fi
-        fi
-    else
-        warn "Could not download SHA256SUMS; skipping checksum verification."
+    # Verification is mandatory: every release ships a SHA256SUMS file.
+    if ! download "${base}/SHA256SUMS" "${tmp}/SHA256SUMS" 2>/dev/null; then
+        die "Could not download SHA256SUMS for ${VERSION}; refusing to install an unverified binary."
     fi
+
+    local expected actual
+    expected="$(awk -v f="$asset" '$2 == f { print $1 }' "${tmp}/SHA256SUMS" | head -n1)"
+    if [ -z "$expected" ]; then
+        die "SHA256SUMS does not list ${asset}; refusing to install an unverified binary."
+    fi
+
+    if ! actual="$(sha256_of "${tmp}/${asset}")"; then
+        die "Neither sha256sum nor shasum is available; cannot verify the download."
+    fi
+
+    if [ "$expected" != "$actual" ]; then
+        error "Checksum mismatch for ${asset}"
+        printf "  expected %s\n  got      %s\n" "$expected" "$actual" >&2
+        die "Refusing to install a binary whose checksum does not match."
+    fi
+    ok "Checksum verified"
 
     info "Installing to $INSTALL_DIR..."
-    mkdir -p "$INSTALL_DIR" || { error "Cannot create $INSTALL_DIR"; rm -rf "$tmp"; return 1; }
+    mkdir -p "$INSTALL_DIR" || { error "Cannot create $INSTALL_DIR"; exit 1; }
 
     if ! tar -xzf "${tmp}/${asset}" -C "$tmp" "$BINARY_NAME"; then
-        warn "Failed to extract ${asset}."
-        rm -rf "$tmp"
-        return 1
+        die "Failed to extract ${asset}."
     fi
 
     cp "${tmp}/${BINARY_NAME}" "$INSTALL_DIR/$BINARY_NAME" || {
         error "Cannot copy to $INSTALL_DIR/$BINARY_NAME"
-        rm -rf "$tmp"
-        return 1
+        exit 1
     }
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
+
+    trap - EXIT
     rm -rf "$tmp"
 
     ok "Installed $BINARY_NAME to $INSTALL_DIR/$BINARY_NAME"
@@ -280,17 +282,28 @@ build_from_source() {
     fi
     ok "zig $ZIG_VERSION"
 
+    # Use the current directory when it is the repository root; otherwise
+    # clone the repository into a temporary directory so that
+    # `curl ... | bash -s -- --from-source` works from anywhere.
+    local src_dir="$PWD"
+    local clone_dir=""
     if [ ! -f "build.zig" ] || [ ! -f "src/main.zig" ]; then
-        die "This script must be run from the git-session repository root to build from source."
+        clone_dir="$(mktemp -d)"
+        trap 'rm -rf "$clone_dir"' EXIT
+        info "Cloning ${REPO}..."
+        if ! git clone --depth 1 "https://github.com/${REPO}.git" "$clone_dir" >/dev/null 2>&1; then
+            die "Could not clone ${REPO}. Run this script from the repository root to build from source."
+        fi
+        src_dir="$clone_dir"
     fi
 
     info "Building git-session..."
-    if ! zig build -Doptimize=ReleaseSafe; then
+    if ! ( cd "$src_dir" && zig build -Doptimize=ReleaseSafe ); then
         die "Build failed. Check the output above for errors."
     fi
     ok "Build complete"
 
-    local build_output="zig-out/bin/$BINARY_NAME"
+    local build_output="$src_dir/zig-out/bin/$BINARY_NAME"
     if [ ! -f "$build_output" ]; then
         die "Build output not found at $build_output"
     fi
@@ -302,6 +315,11 @@ build_from_source() {
         exit 1
     }
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
+
+    if [ -n "$clone_dir" ]; then
+        trap - EXIT
+        rm -rf "$clone_dir"
+    fi
 
     ok "Installed $BINARY_NAME to $INSTALL_DIR/$BINARY_NAME"
 }
