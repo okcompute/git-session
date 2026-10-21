@@ -11,7 +11,7 @@ git-session handles:
 
 ## Requirements
 
-- Git
+- Git (>= 2.42 to create sessions in empty repositories)
 - TMUX (>= 3.0)
 
 [Zig](https://ziglang.org/) 0.16+ is required only when building from source.

@@ -106,6 +106,10 @@ the codebase.
   short-lived and bounded in size.
 - Relative `@import("module.zig")` for internal modules, not package
   paths.
+- Sessions in an empty repository live on an unborn orphan branch:
+  `refs/heads/<branch>` does not exist until the first commit. Flag git
+  calls that assume it does (e.g. `rev-parse` on `HEAD` or the branch,
+  unguarded `branch -D`); prefer `symbolic-ref` and `gitBranchExists`.
 
 ## TUI rendering (tui.zig)
 

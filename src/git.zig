@@ -58,7 +58,44 @@ pub fn gitBranchExists(allocator: std.mem.Allocator, io: std.Io, bare_repo_path:
     return result.exited_ok;
 }
 
-/// Returns the ref new worktrees should be based on for `base_branch`:
+/// Returns `true` when the fully qualified `ref` resolves in the
+/// repository at `bare_repo_path`. Returns `false` on any allocation or
+/// process error.
+fn refExists(allocator: std.mem.Allocator, io: std.Io, bare_repo_path: []const u8, ref: []const u8) bool {
+    const result = process.exec(allocator, io, &.{ "git", "rev-parse", "--verify", "--quiet", ref }, bare_repo_path) catch return false;
+    defer process.freeExecResult(allocator, result);
+    return result.exited_ok;
+}
+
+/// Returns `true` when the repository at `bare_repo_path` has no refs
+/// at all, i.e. it holds no commits yet (typically a clone of an empty
+/// remote). Returns `false` on any allocation or process error so that
+/// callers fall back to the regular, non-orphan behaviour.
+fn repoHasNoCommits(allocator: std.mem.Allocator, io: std.Io, bare_repo_path: []const u8) bool {
+    const result = process.exec(allocator, io, &.{ "git", "for-each-ref", "--count=1" }, bare_repo_path) catch return false;
+    defer process.freeExecResult(allocator, result);
+    return result.exited_ok and std.mem.trim(u8, result.stdout_data, " \t\r\n").len == 0;
+}
+
+/// What a new worktree branch starts from, as resolved by
+/// `resolveWorktreeBase`.
+const WorktreeBase = union(enum) {
+    /// Fully qualified, heap-allocated ref the new branch is created from.
+    ref: []u8,
+    /// The repository has no commits yet, so the new branch is created
+    /// as an orphan (`git worktree add --orphan`).
+    orphan,
+
+    /// Frees the heap-allocated ref, if any. Safe to call on `.orphan`.
+    fn deinit(self: WorktreeBase, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .ref => |r| allocator.free(r),
+            .orphan => {},
+        }
+    }
+};
+
+/// Returns what new worktrees should be based on for `base_branch`:
 /// the remote-tracking ref `refs/remotes/origin/<base_branch>` when it
 /// exists, otherwise the fully qualified local branch
 /// `refs/heads/<base_branch>` as a fallback (e.g. a repository without
@@ -68,27 +105,85 @@ pub fn gitBranchExists(allocator: std.mem.Allocator, io: std.Io, bare_repo_path:
 /// frozen at clone time so the remote-tracking ref is still the better
 /// base (the fetch warning tells the user the ref may be stale). Both
 /// candidates are fully qualified so a tag named like the branch can
-/// never shadow the intended ref. The returned slice is heap-allocated
-/// and must be freed by the caller.
-fn resolveWorktreeBaseRef(allocator: std.mem.Allocator, io: std.Io, bare_repo_path: []const u8, base_branch: []const u8) ![]u8 {
-    // Scoped so the errdefer cannot double-free once the fallback path
-    // below has already released `remote_ref`.
-    use_local_branch: {
-        const remote_ref = try std.fmt.allocPrint(allocator, "refs/remotes/origin/{s}", .{base_branch});
-        errdefer allocator.free(remote_ref);
+/// never shadow the intended ref. When neither exists and the
+/// repository has no commits at all (a clone of an empty remote),
+/// `.orphan` is returned. The caller must call `deinit` on the result.
+fn resolveWorktreeBase(allocator: std.mem.Allocator, io: std.Io, bare_repo_path: []const u8, base_branch: []const u8) !WorktreeBase {
+    const remote_ref = try std.fmt.allocPrint(allocator, "refs/remotes/origin/{s}", .{base_branch});
+    if (refExists(allocator, io, bare_repo_path, remote_ref)) return .{ .ref = remote_ref };
+    allocator.free(remote_ref);
 
-        const remote_ref_ok = blk: {
-            const result = process.exec(allocator, io, &.{ "git", "rev-parse", "--verify", remote_ref }, bare_repo_path) catch break :blk false;
-            defer process.freeExecResult(allocator, result);
-            break :blk result.exited_ok;
-        };
+    const local_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{base_branch});
+    if (refExists(allocator, io, bare_repo_path, local_ref)) return .{ .ref = local_ref };
 
-        if (remote_ref_ok) return remote_ref;
-        allocator.free(remote_ref);
-        break :use_local_branch;
+    if (repoHasNoCommits(allocator, io, bare_repo_path)) {
+        allocator.free(local_ref);
+        return .orphan;
     }
 
-    return std.fmt.allocPrint(allocator, "refs/heads/{s}", .{base_branch});
+    // The base branch is missing from a non-empty repository: let
+    // `git worktree add` fail and report it.
+    return .{ .ref = local_ref };
+}
+
+/// Runs `git worktree add` in `bare_repo` to create `worktree_rel` on a
+/// new branch `branch_name` starting from `base`. Orphan worktrees
+/// require git >= 2.42.
+fn execWorktreeAdd(allocator: std.mem.Allocator, io: std.Io, bare_repo: []const u8, worktree_rel: []const u8, branch_name: []const u8, base: WorktreeBase) !process.ExecResult {
+    return switch (base) {
+        .ref => |r| process.exec(allocator, io, &.{ "git", "worktree", "add", worktree_rel, "-b", branch_name, "--no-track", r }, bare_repo),
+        .orphan => process.exec(allocator, io, &.{ "git", "worktree", "add", "--orphan", "-b", branch_name, worktree_rel }, bare_repo),
+    };
+}
+
+/// Returns a short description of `base` for user-facing messages.
+fn describeWorktreeBase(base: WorktreeBase) []const u8 {
+    return switch (base) {
+        .ref => |r| r,
+        .orphan => "an empty repository (orphan branch)",
+    };
+}
+
+/// Hint appended to worktree errors for orphan worktrees, whose
+/// `--orphan` flag older git versions reject.
+const orphan_git_version_hint = "creating a session in an empty repository requires git >= 2.42";
+
+/// Returns the line of git's `stderr` that describes a failure: the
+/// last line starting with `fatal:` or `error:`, otherwise the last
+/// non-empty line. Informational lines ("Preparing worktree") and the
+/// usage text git prints after `error: unknown option` are skipped this
+/// way. Returns an empty slice when `stderr` has no content. The
+/// returned slice points into `stderr`.
+fn gitErrorLine(stderr: []const u8) []const u8 {
+    var last: []const u8 = "";
+    var last_error: []const u8 = "";
+    var lines = std.mem.tokenizeAny(u8, stderr, "\r\n");
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) continue;
+        last = trimmed;
+        if (std.mem.startsWith(u8, trimmed, "fatal:") or std.mem.startsWith(u8, trimmed, "error:")) last_error = trimmed;
+    }
+    return if (last_error.len > 0) last_error else last;
+}
+
+/// Returns `true` when a failed `git worktree add` for `base`, whose
+/// error line is `error_line` (see `gitErrorLine`), may be caused by a
+/// git version without `--orphan` support: the base is `.orphan` and
+/// git either printed nothing or rejected an unknown option.
+fn needsOrphanGitVersionHint(base: WorktreeBase, error_line: []const u8) bool {
+    return base == .orphan and (error_line.len == 0 or std.mem.indexOf(u8, error_line, "unknown option") != null);
+}
+
+/// Builds the user-facing error message for a failed `git worktree add`
+/// from git's `stderr` (see `gitErrorLine`), appending a hint about the
+/// minimum git version when `needsOrphanGitVersionHint` holds. The
+/// returned slice is heap-allocated and must be freed by the caller.
+fn worktreeErrorMessage(allocator: std.mem.Allocator, stderr: []const u8, base: WorktreeBase) ![]u8 {
+    const line = gitErrorLine(stderr);
+    const hint: []const u8 = if (needsOrphanGitVersionHint(base, line)) " (" ++ orphan_git_version_hint ++ ")" else "";
+    if (line.len == 0) return std.fmt.allocPrint(allocator, "Failed to create worktree{s}", .{hint});
+    return std.fmt.allocPrint(allocator, "Failed to create worktree: {s}{s}", .{ line, hint });
 }
 
 /// Creates a new git worktree next to the bare repository under
@@ -98,7 +193,9 @@ fn resolveWorktreeBaseRef(allocator: std.mem.Allocator, io: std.Io, bare_repo_pa
 /// base, so the worktree always starts from the latest origin state
 /// regardless of where the local `base_branch` points. When the
 /// remote-tracking ref does not exist (e.g. no reachable origin), the
-/// local `base_branch` is used as a fallback. `bare_repo_name` is the
+/// local `base_branch` is used as a fallback. When the repository has no
+/// commits at all (a clone of an empty remote), the new branch is
+/// created as an orphan instead. `bare_repo_name` is the
 /// directory name of the bare repo (without the `.git` suffix) and
 /// `worktree_name` becomes the new worktree directory name. Returns
 /// `error.GitWorktreeCreationFailed` when the git command exits with a
@@ -120,25 +217,27 @@ pub fn gitCreateWorktree(
 
     try gitFetchBranch(allocator, io, bare_repo, base_branch);
 
-    const base_ref = try resolveWorktreeBaseRef(allocator, io, bare_repo, base_branch);
-    defer allocator.free(base_ref);
+    const base = try resolveWorktreeBase(allocator, io, bare_repo, base_branch);
+    defer base.deinit(allocator);
 
-    const result = try process.exec(allocator, io, &.{
-        "git", "worktree", "add", worktree_rel, "-b", branch_name, "--no-track", base_ref,
-    }, bare_repo);
+    const result = try execWorktreeAdd(allocator, io, bare_repo, worktree_rel, branch_name, base);
     defer process.freeExecResult(allocator, result);
 
     if (!result.exited_ok) {
         term.eprint(io, "Error creating worktree: {s}\n", .{result.stderr_data});
+        if (needsOrphanGitVersionHint(base, gitErrorLine(result.stderr_data))) term.eprint(io, "Note: {s}\n", .{orphan_git_version_hint});
         return error.GitWorktreeCreationFailed;
     }
 
-    term.print(io, "Created worktree '{s}' from '{s}'\n", .{ worktree_name, base_ref });
+    term.print(io, "Created worktree '{s}' from {s}\n", .{ worktree_name, describeWorktreeBase(base) });
 }
 
 /// Same as `gitCreateWorktree` but streams progress output to a
 /// `ProgressOutput` for live TUI feedback during the fetch and
-/// worktree creation steps.
+/// worktree creation steps. Returns `null` on success. When
+/// `git worktree add` fails, returns an error message (including git's
+/// own error line) owned by the caller. Allocation or process-spawn
+/// failures are propagated.
 pub fn gitCreateWorktreeWithProgress(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -148,7 +247,7 @@ pub fn gitCreateWorktreeWithProgress(
     branch_name: []const u8,
     base_branch: []const u8,
     progress: *process.ProgressOutput,
-) !void {
+) !?[]u8 {
     const bare_repo = try std.fmt.allocPrint(allocator, "{s}/{s}.git", .{ repo_root, bare_repo_name });
     defer allocator.free(bare_repo);
 
@@ -162,26 +261,25 @@ pub fn gitCreateWorktreeWithProgress(
     }
     try gitFetchBranchWithProgress(allocator, io, bare_repo, base_branch, progress);
 
-    const base_ref = try resolveWorktreeBaseRef(allocator, io, bare_repo, base_branch);
-    defer allocator.free(base_ref);
+    const base = try resolveWorktreeBase(allocator, io, bare_repo, base_branch);
+    defer base.deinit(allocator);
 
-    const wt_msg = std.fmt.allocPrint(allocator, "Creating worktree '{s}' from '{s}'...", .{ worktree_name, base_ref }) catch null;
+    const wt_msg = std.fmt.allocPrint(allocator, "Creating worktree '{s}' from {s}...", .{ worktree_name, describeWorktreeBase(base) }) catch null;
     if (wt_msg) |m| {
         progress.appendLine(m);
         allocator.free(m);
     }
 
-    const result = try process.exec(allocator, io, &.{
-        "git", "worktree", "add", worktree_rel, "-b", branch_name, "--no-track", base_ref,
-    }, bare_repo);
+    const result = try execWorktreeAdd(allocator, io, bare_repo, worktree_rel, branch_name, base);
     defer process.freeExecResult(allocator, result);
 
     if (!result.exited_ok) {
         progress.appendLine("Error creating worktree");
-        return error.GitWorktreeCreationFailed;
+        return try worktreeErrorMessage(allocator, result.stderr_data, base);
     }
 
     progress.appendLine("Worktree created successfully");
+    return null;
 }
 
 /// Force-removes the git worktree for `worktree_name`.
@@ -248,12 +346,13 @@ pub fn gitDeleteBranch(allocator: std.mem.Allocator, io: std.Io, bare_repo_path:
 }
 
 /// Returns the current branch name of the worktree at `worktree_path`
-/// by running `git rev-parse --abbrev-ref HEAD`. The returned slice is
-/// heap-allocated and must be freed by the caller. Returns `null` when
-/// the branch cannot be determined (e.g. detached HEAD, missing
-/// directory, or process failure).
+/// by running `git symbolic-ref --short HEAD`, which also works on a
+/// branch without commits yet (e.g. an orphan branch in an empty
+/// repository). The returned slice is heap-allocated and must be freed
+/// by the caller. Returns `null` when the branch cannot be determined
+/// (e.g. detached HEAD, missing directory, or process failure).
 pub fn gitWorktreeBranch(allocator: std.mem.Allocator, io: std.Io, worktree_path: []const u8) ?[]const u8 {
-    const result = process.exec(allocator, io, &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }, worktree_path) catch return null;
+    const result = process.exec(allocator, io, &.{ "git", "symbolic-ref", "--quiet", "--short", "HEAD" }, worktree_path) catch return null;
     defer process.freeExecResult(allocator, result);
     if (!result.exited_ok) return null;
 
@@ -599,6 +698,124 @@ test "gitCreateWorktree falls back to the local branch when origin ref is missin
     defer allocator.free(worktree_head);
 
     try testing.expectEqualStrings(local_main, worktree_head);
+}
+
+test "gitCreateWorktree creates an orphan branch when the cloned repository is empty" {
+    term.setQuiet(true);
+    defer term.setQuiet(false);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = testing.allocator;
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    // Upstream: an empty bare repository with no commits at all.
+    const upstream_dir = try std.fmt.allocPrint(allocator, "{s}/upstream.git", .{tmp_path});
+    defer allocator.free(upstream_dir);
+    try std.Io.Dir.cwd().createDirPath(testing.io, upstream_dir);
+    const init_res = try process.exec(allocator, testing.io, &.{ "git", "init", "--quiet", "--bare", "-b", "main" }, upstream_dir);
+    process.freeExecResult(allocator, init_res);
+    if (!init_res.exited_ok) return error.SkipZigTest;
+
+    const url = try std.fmt.allocPrint(allocator, "file://{s}", .{upstream_dir});
+    defer allocator.free(url);
+
+    const repo_root = try std.fmt.allocPrint(allocator, "{s}/my-repo", .{tmp_path});
+    defer allocator.free(repo_root);
+    try std.Io.Dir.cwd().createDirPath(testing.io, repo_root);
+    try gitCloneForSession(allocator, testing.io, url, repo_root, "my-repo");
+
+    var progress = process.ProgressOutput.init(allocator, testing.io);
+    defer progress.deinit();
+    const err_msg = try gitCreateWorktreeWithProgress(allocator, testing.io, repo_root, "my-repo", "wt-feature", "feature/x", "main", &progress);
+    defer if (err_msg) |m| allocator.free(m);
+    if (err_msg) |m| {
+        // `git worktree add --orphan` needs git >= 2.42; any other
+        // failure is a real regression.
+        if (std.mem.indexOf(u8, m, "unknown option") != null) return error.SkipZigTest;
+        std.debug.print("unexpected worktree error: {s}\n", .{m});
+        return error.TestUnexpectedResult;
+    }
+
+    const worktree_dir = try std.fmt.allocPrint(allocator, "{s}/wt-feature", .{repo_root});
+    defer allocator.free(worktree_dir);
+    const branch = gitWorktreeBranch(allocator, testing.io, worktree_dir) orelse return error.TestUnexpectedResult;
+    defer allocator.free(branch);
+    try testing.expectEqualStrings("feature/x", branch);
+}
+
+test "gitCreateWorktreeWithProgress reports git's error when the base branch is missing" {
+    term.setQuiet(true);
+    defer term.setQuiet(false);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = testing.allocator;
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    // A non-empty repository without the requested base branch must
+    // not fall back to an orphan branch.
+    const repo_root = try std.fmt.allocPrint(allocator, "{s}/my-repo", .{tmp_path});
+    defer allocator.free(repo_root);
+    const bare_repo = try std.fmt.allocPrint(allocator, "{s}/my-repo.git", .{repo_root});
+    defer allocator.free(bare_repo);
+    try std.Io.Dir.cwd().createDirPath(testing.io, bare_repo);
+    try gitInitOrSkip(allocator, testing.io, bare_repo);
+    try execOk(allocator, testing.io, &.{ "git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init", "--quiet" }, bare_repo);
+
+    var progress = process.ProgressOutput.init(allocator, testing.io);
+    defer progress.deinit();
+    const err_msg = try gitCreateWorktreeWithProgress(allocator, testing.io, repo_root, "my-repo", "wt-feature", "feature/x", "does-not-exist", &progress);
+    const msg = err_msg orelse return error.TestUnexpectedResult;
+    defer allocator.free(msg);
+    try testing.expect(std.mem.startsWith(u8, msg, "Failed to create worktree: "));
+    try testing.expect(std.mem.indexOf(u8, msg, "refs/heads/does-not-exist") != null);
+}
+
+test "gitErrorLine picks the fatal line after informational output" {
+    try testing.expectEqualStrings("fatal: invalid reference: main", gitErrorLine("Preparing worktree (new branch 'x')\nfatal: invalid reference: main\n\n"));
+}
+
+test "gitErrorLine skips usage text after an unknown option error" {
+    const stderr = "error: unknown option `orphan'\nusage: git worktree add [<options>] <path> [<commit-ish>]\n\n    -f, --force           checkout <branch> even if already checked out\n    --guess-remote        try to match the new branch name with a remote-tracking branch\n";
+    try testing.expectEqualStrings("error: unknown option `orphan'", gitErrorLine(stderr));
+}
+
+test "gitErrorLine falls back to the last non-empty line" {
+    try testing.expectEqualStrings("something went wrong", gitErrorLine("first\r\nsomething went wrong  \n \n"));
+}
+
+test "gitErrorLine returns an empty slice for blank stderr" {
+    try testing.expectEqualStrings("", gitErrorLine(" \n\r\n"));
+}
+
+test "worktreeErrorMessage includes git's error line" {
+    var ref = "refs/heads/main".*;
+    const msg = try worktreeErrorMessage(testing.allocator, "fatal: invalid reference: main\n", .{ .ref = &ref });
+    defer testing.allocator.free(msg);
+    try testing.expectEqualStrings("Failed to create worktree: fatal: invalid reference: main", msg);
+}
+
+test "worktreeErrorMessage adds the git version hint for orphan worktrees" {
+    const msg = try worktreeErrorMessage(testing.allocator, "error: unknown option `orphan'\n", .orphan);
+    defer testing.allocator.free(msg);
+    try testing.expectEqualStrings("Failed to create worktree: error: unknown option `orphan' (" ++ orphan_git_version_hint ++ ")", msg);
+}
+
+test "worktreeErrorMessage omits the git version hint for unrelated orphan failures" {
+    const msg = try worktreeErrorMessage(testing.allocator, "fatal: '../x' already exists\n", .orphan);
+    defer testing.allocator.free(msg);
+    try testing.expectEqualStrings("Failed to create worktree: fatal: '../x' already exists", msg);
+}
+
+test "worktreeErrorMessage falls back to a generic message for empty stderr" {
+    const msg = try worktreeErrorMessage(testing.allocator, " \n", .orphan);
+    defer testing.allocator.free(msg);
+    try testing.expectEqualStrings("Failed to create worktree (" ++ orphan_git_version_hint ++ ")", msg);
 }
 
 test "removeWorktreeDirectoryFallback deletes directory with session file in bare repo" {
