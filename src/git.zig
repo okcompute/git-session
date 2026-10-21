@@ -86,6 +86,7 @@ const WorktreeBase = union(enum) {
     /// as an orphan (`git worktree add --orphan`).
     orphan,
 
+    /// Frees the heap-allocated ref, if any. Safe to call on `.orphan`.
     fn deinit(self: WorktreeBase, allocator: std.mem.Allocator) void {
         switch (self) {
             .ref => |r| allocator.free(r),
@@ -143,20 +144,38 @@ fn describeWorktreeBase(base: WorktreeBase) []const u8 {
     };
 }
 
-/// Builds the user-facing error message for a failed `git worktree add`
-/// from the last non-empty line of git's `stderr` (where git reports
-/// the fatal error, after informational lines such as "Preparing
-/// worktree"). The returned slice is heap-allocated and must be freed
-/// by the caller.
-fn worktreeErrorMessage(allocator: std.mem.Allocator, stderr: []const u8) ![]u8 {
+/// Hint appended to worktree errors for orphan worktrees, whose
+/// `--orphan` flag older git versions reject.
+const orphan_git_version_hint = "creating a session in an empty repository requires git >= 2.42";
+
+/// Returns the line of git's `stderr` that describes a failure: the
+/// last line starting with `fatal:` or `error:`, otherwise the last
+/// non-empty line. Informational lines ("Preparing worktree") and the
+/// usage text git prints after `error: unknown option` are skipped this
+/// way. Returns an empty slice when `stderr` has no content. The
+/// returned slice points into `stderr`.
+fn gitErrorLine(stderr: []const u8) []const u8 {
     var last: []const u8 = "";
+    var last_error: []const u8 = "";
     var lines = std.mem.tokenizeAny(u8, stderr, "\r\n");
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t");
-        if (trimmed.len > 0) last = trimmed;
+        if (trimmed.len == 0) continue;
+        last = trimmed;
+        if (std.mem.startsWith(u8, trimmed, "fatal:") or std.mem.startsWith(u8, trimmed, "error:")) last_error = trimmed;
     }
-    if (last.len == 0) return allocator.dupe(u8, "Failed to create worktree");
-    return std.fmt.allocPrint(allocator, "Failed to create worktree: {s}", .{last});
+    return if (last_error.len > 0) last_error else last;
+}
+
+/// Builds the user-facing error message for a failed `git worktree add`
+/// from git's `stderr` (see `gitErrorLine`). For `.orphan` bases a hint
+/// about the minimum git version is appended. The returned slice is
+/// heap-allocated and must be freed by the caller.
+fn worktreeErrorMessage(allocator: std.mem.Allocator, stderr: []const u8, base: WorktreeBase) ![]u8 {
+    const line = gitErrorLine(stderr);
+    const hint: []const u8 = if (base == .orphan) " (" ++ orphan_git_version_hint ++ ")" else "";
+    if (line.len == 0) return std.fmt.allocPrint(allocator, "Failed to create worktree{s}", .{hint});
+    return std.fmt.allocPrint(allocator, "Failed to create worktree: {s}{s}", .{ line, hint });
 }
 
 /// Creates a new git worktree next to the bare repository under
@@ -198,6 +217,7 @@ pub fn gitCreateWorktree(
 
     if (!result.exited_ok) {
         term.eprint(io, "Error creating worktree: {s}\n", .{result.stderr_data});
+        if (base == .orphan) term.eprint(io, "Note: {s}\n", .{orphan_git_version_hint});
         return error.GitWorktreeCreationFailed;
     }
 
@@ -247,7 +267,7 @@ pub fn gitCreateWorktreeWithProgress(
 
     if (!result.exited_ok) {
         progress.appendLine("Error creating worktree");
-        return try worktreeErrorMessage(allocator, result.stderr_data);
+        return try worktreeErrorMessage(allocator, result.stderr_data, base);
     }
 
     progress.appendLine("Worktree created successfully");
@@ -703,8 +723,13 @@ test "gitCreateWorktree creates an orphan branch when the cloned repository is e
     defer progress.deinit();
     const err_msg = try gitCreateWorktreeWithProgress(allocator, testing.io, repo_root, "my-repo", "wt-feature", "feature/x", "main", &progress);
     defer if (err_msg) |m| allocator.free(m);
-    // `git worktree add --orphan` needs git >= 2.42.
-    if (err_msg != null) return error.SkipZigTest;
+    if (err_msg) |m| {
+        // `git worktree add --orphan` needs git >= 2.42; any other
+        // failure is a real regression.
+        if (std.mem.indexOf(u8, m, "unknown option") != null) return error.SkipZigTest;
+        std.debug.print("unexpected worktree error: {s}\n", .{m});
+        return error.TestUnexpectedResult;
+    }
 
     const worktree_dir = try std.fmt.allocPrint(allocator, "{s}/wt-feature", .{repo_root});
     defer allocator.free(worktree_dir);
@@ -743,16 +768,40 @@ test "gitCreateWorktreeWithProgress reports git's error when the base branch is 
     try testing.expect(std.mem.indexOf(u8, msg, "refs/heads/does-not-exist") != null);
 }
 
-test "worktreeErrorMessage uses the last non-empty stderr line" {
-    const msg = try worktreeErrorMessage(testing.allocator, "Preparing worktree (new branch 'x')\nfatal: invalid reference: main\n\n");
+test "gitErrorLine picks the fatal line after informational output" {
+    try testing.expectEqualStrings("fatal: invalid reference: main", gitErrorLine("Preparing worktree (new branch 'x')\nfatal: invalid reference: main\n\n"));
+}
+
+test "gitErrorLine skips usage text after an unknown option error" {
+    const stderr = "error: unknown option `orphan'\nusage: git worktree add [<options>] <path> [<commit-ish>]\n\n    -f, --force           checkout <branch> even if already checked out\n    --guess-remote        try to match the new branch name with a remote-tracking branch\n";
+    try testing.expectEqualStrings("error: unknown option `orphan'", gitErrorLine(stderr));
+}
+
+test "gitErrorLine falls back to the last non-empty line" {
+    try testing.expectEqualStrings("something went wrong", gitErrorLine("first\r\nsomething went wrong  \n \n"));
+}
+
+test "gitErrorLine returns an empty slice for blank stderr" {
+    try testing.expectEqualStrings("", gitErrorLine(" \n\r\n"));
+}
+
+test "worktreeErrorMessage includes git's error line" {
+    var ref = "refs/heads/main".*;
+    const msg = try worktreeErrorMessage(testing.allocator, "fatal: invalid reference: main\n", .{ .ref = &ref });
     defer testing.allocator.free(msg);
     try testing.expectEqualStrings("Failed to create worktree: fatal: invalid reference: main", msg);
 }
 
-test "worktreeErrorMessage falls back to a generic message for empty stderr" {
-    const msg = try worktreeErrorMessage(testing.allocator, " \n");
+test "worktreeErrorMessage adds the git version hint for orphan worktrees" {
+    const msg = try worktreeErrorMessage(testing.allocator, "error: unknown option `orphan'\n", .orphan);
     defer testing.allocator.free(msg);
-    try testing.expectEqualStrings("Failed to create worktree", msg);
+    try testing.expectEqualStrings("Failed to create worktree: error: unknown option `orphan' (" ++ orphan_git_version_hint ++ ")", msg);
+}
+
+test "worktreeErrorMessage falls back to a generic message for empty stderr" {
+    const msg = try worktreeErrorMessage(testing.allocator, " \n", .orphan);
+    defer testing.allocator.free(msg);
+    try testing.expectEqualStrings("Failed to create worktree (" ++ orphan_git_version_hint ++ ")", msg);
 }
 
 test "removeWorktreeDirectoryFallback deletes directory with session file in bare repo" {

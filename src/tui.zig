@@ -1458,11 +1458,14 @@ pub const TuiApp = struct {
         // Clean up session metadata now that the worktree is gone.
         repo.deleteSessionFile(self.allocator, self.io, bare_repo_path, session_name);
 
+        // An orphan branch with no commits yet has no ref to delete.
         if (self.worker_rm_branch_name) |branch_name| {
-            git.gitDeleteBranch(self.allocator, self.io, bare_repo_path, branch_name) catch {
-                self.worker_error = self.allocator.dupe(u8, "Failed to delete branch") catch null;
-                return;
-            };
+            if (git.gitBranchExists(self.allocator, self.io, bare_repo_path, branch_name)) {
+                git.gitDeleteBranch(self.allocator, self.io, bare_repo_path, branch_name) catch {
+                    self.worker_error = self.allocator.dupe(u8, "Failed to delete branch") catch null;
+                    return;
+                };
+            }
         }
     }
 
@@ -2685,9 +2688,11 @@ pub const TuiApp = struct {
             .surface = msg.draw(ctx.withConstraints(.{}, ctx.max)) catch return emptyWidget(arena),
         };
 
+        // Place the hint below the message, which may soft-wrap over
+        // several rows (e.g. long git error lines).
         const hint: vxfw.Text = .{ .text = "  Press any key to continue...", .style = style.dimmed, .width_basis = .parent };
         children[1] = .{
-            .origin = .{ .row = 4, .col = 0 },
+            .origin = .{ .row = 2 + @as(i17, children[0].surface.size.height) + 1, .col = 0 },
             .surface = hint.draw(ctx.withConstraints(.{}, ctx.max)) catch return emptyWidget(arena),
         };
 

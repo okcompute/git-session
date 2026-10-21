@@ -839,10 +839,13 @@ fn runRemoveNonInteractive(
     // Clean up metadata and branch.
     repo.deleteSessionFile(allocator, io, bare_repo_path, session_name);
 
+    // An orphan branch with no commits yet has no ref to delete.
     if (branch_name) |bn| {
-        git.gitDeleteBranch(allocator, io, bare_repo_path, bn) catch {
-            term.eprint(io, "Warning: could not delete branch '{s}'.\n", .{bn});
-        };
+        if (git.gitBranchExists(allocator, io, bare_repo_path, bn)) {
+            git.gitDeleteBranch(allocator, io, bare_repo_path, bn) catch {
+                term.eprint(io, "Warning: could not delete branch '{s}'.\n", .{bn});
+            };
+        }
     }
 
     term.print(io, "Session '{s}' removed.\n", .{session_name});

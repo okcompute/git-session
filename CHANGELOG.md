@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Creating a session in a repository cloned from an empty remote (no commits yet) no longer fails with a generic "Failed to create worktree" error. The session's branch is now created as an orphan branch (requires git >= 2.42).
 - When worktree creation fails in the TUI, the error message now includes git's own error line instead of only a generic message.
+- Removing a session whose branch has no commits yet no longer reports a "Failed to delete branch" error.
+- Long messages in the TUI no longer overlap the "Press any key to continue..." hint.
 - Determining a session's branch from its worktree now works on branches without commits and correctly reports nothing for a detached HEAD.
 
 ## [1.0.0] - 2026-09-30
