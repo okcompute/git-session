@@ -167,13 +167,21 @@ fn gitErrorLine(stderr: []const u8) []const u8 {
     return if (last_error.len > 0) last_error else last;
 }
 
+/// Returns `true` when a failed `git worktree add` for `base`, whose
+/// error line is `error_line` (see `gitErrorLine`), may be caused by a
+/// git version without `--orphan` support: the base is `.orphan` and
+/// git either printed nothing or rejected an unknown option.
+fn needsOrphanGitVersionHint(base: WorktreeBase, error_line: []const u8) bool {
+    return base == .orphan and (error_line.len == 0 or std.mem.indexOf(u8, error_line, "unknown option") != null);
+}
+
 /// Builds the user-facing error message for a failed `git worktree add`
-/// from git's `stderr` (see `gitErrorLine`). For `.orphan` bases a hint
-/// about the minimum git version is appended. The returned slice is
-/// heap-allocated and must be freed by the caller.
+/// from git's `stderr` (see `gitErrorLine`), appending a hint about the
+/// minimum git version when `needsOrphanGitVersionHint` holds. The
+/// returned slice is heap-allocated and must be freed by the caller.
 fn worktreeErrorMessage(allocator: std.mem.Allocator, stderr: []const u8, base: WorktreeBase) ![]u8 {
     const line = gitErrorLine(stderr);
-    const hint: []const u8 = if (base == .orphan) " (" ++ orphan_git_version_hint ++ ")" else "";
+    const hint: []const u8 = if (needsOrphanGitVersionHint(base, line)) " (" ++ orphan_git_version_hint ++ ")" else "";
     if (line.len == 0) return std.fmt.allocPrint(allocator, "Failed to create worktree{s}", .{hint});
     return std.fmt.allocPrint(allocator, "Failed to create worktree: {s}{s}", .{ line, hint });
 }
@@ -217,7 +225,7 @@ pub fn gitCreateWorktree(
 
     if (!result.exited_ok) {
         term.eprint(io, "Error creating worktree: {s}\n", .{result.stderr_data});
-        if (base == .orphan) term.eprint(io, "Note: {s}\n", .{orphan_git_version_hint});
+        if (needsOrphanGitVersionHint(base, gitErrorLine(result.stderr_data))) term.eprint(io, "Note: {s}\n", .{orphan_git_version_hint});
         return error.GitWorktreeCreationFailed;
     }
 
@@ -796,6 +804,12 @@ test "worktreeErrorMessage adds the git version hint for orphan worktrees" {
     const msg = try worktreeErrorMessage(testing.allocator, "error: unknown option `orphan'\n", .orphan);
     defer testing.allocator.free(msg);
     try testing.expectEqualStrings("Failed to create worktree: error: unknown option `orphan' (" ++ orphan_git_version_hint ++ ")", msg);
+}
+
+test "worktreeErrorMessage omits the git version hint for unrelated orphan failures" {
+    const msg = try worktreeErrorMessage(testing.allocator, "fatal: '../x' already exists\n", .orphan);
+    defer testing.allocator.free(msg);
+    try testing.expectEqualStrings("Failed to create worktree: fatal: '../x' already exists", msg);
 }
 
 test "worktreeErrorMessage falls back to a generic message for empty stderr" {
