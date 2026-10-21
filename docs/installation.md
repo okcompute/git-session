@@ -63,7 +63,7 @@ To always fetch the newest release, replace `releases/download/${VERSION}` with 
 
 ## Requirements
 
-- Git
+- Git (>= 2.42 to create sessions in empty repositories)
 - tmux >= 3.0
 
 Zig 0.16+ is required only when building from source.

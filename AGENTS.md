@@ -17,13 +17,7 @@ When checking if the branch needs to be pushed before creating a PR:
 - Always run `git fetch origin` first to ensure remote refs are up to date.
 - Then check whether the branch exists on the remote by running `git rev-parse origin/<branch> 2>/dev/null`. Do NOT rely solely on `@{u}` (the upstream tracking ref) — a branch can exist on the remote without having a local tracking ref configured (e.g., if pushed with `git push origin <branch>` without `-u`).
 - If `origin/<branch>` exists, compare `git rev-parse HEAD` with `git rev-parse origin/<branch>`. If they match, the branch is up to date — do not push or prompt to push.
-- If `origin/<branch>` does not exist, the branch has not been pushed. Inform the user that they need to push — do not push on the agent's behalf (see Git Push Policy).
-
-## Git Push Policy
-
-Agents must NEVER push to the remote repository. Only humans are allowed to push. If the branch needs to be pushed before a PR can be created, inform the user and wait for them to push it themselves.
-
-Agents must NEVER run git write operations such as `git push`, `git commit`, `git rebase`, `git merge`, `git reset`, `git checkout`, `git branch -d`, or `git stash`. Read-only git commands (`git status`, `git log`, `git diff`, `git fetch`, `git rev-parse`, `git branch --list`) are allowed.
+- If `origin/<branch>` does not exist, or it differs from `HEAD`, push the branch before creating the PR.
 
 ## Changelog
 
