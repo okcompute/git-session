@@ -1233,10 +1233,14 @@ pub const TuiApp = struct {
 
         // Create worktree with progress feedback
         if (self.worker_progress) |progress| {
-            git.gitCreateWorktreeWithProgress(self.allocator, self.io, repo_root, bare_repo_name, name, branch_name, base_branch, progress) catch {
+            const wt_err = git.gitCreateWorktreeWithProgress(self.allocator, self.io, repo_root, bare_repo_name, name, branch_name, base_branch, progress) catch {
                 self.worker_error = self.allocator.dupe(u8, "Failed to create worktree") catch null;
                 return;
             };
+            if (wt_err) |err_msg| {
+                self.worker_error = err_msg;
+                return;
+            }
             progress.appendLine("Saving session file...");
         } else {
             git.gitCreateWorktree(self.allocator, self.io, repo_root, bare_repo_name, name, branch_name, base_branch) catch {
