@@ -25,6 +25,7 @@ BINARY_NAME="git-session"
 REPO="okcompute/git-session"
 VERSION="latest"
 FROM_SOURCE=0
+STAGED=""
 
 # --- Colors (disabled if not a terminal) ---
 if [ -t 1 ]; then
@@ -184,6 +185,26 @@ check_runtime_deps() {
     [ "$MISSING" -eq 0 ] || die "Missing prerequisites. Install the tools listed above and try again."
 }
 
+# Installs the binary at $1 as $INSTALL_DIR/$BINARY_NAME. The binary is
+# copied to a temporary file in the same directory and renamed over the
+# target, so the target becomes a new file. Overwriting it in place while
+# the old version is running (e.g. in tmux) makes macOS, which caches
+# code signatures per file, kill the updated binary with SIGKILL. The
+# staged path is kept in STAGED so the callers' EXIT traps can remove it
+# if the install is interrupted.
+install_binary() {
+    local src="$1"
+    local dest="$INSTALL_DIR/$BINARY_NAME"
+
+    mkdir -p "$INSTALL_DIR" || die "Cannot create $INSTALL_DIR"
+    STAGED="$INSTALL_DIR/.${BINARY_NAME}.tmp.$$"
+    if ! cp "$src" "$STAGED" || ! chmod +x "$STAGED" || ! mv -f "$STAGED" "$dest"; then
+        rm -f "$STAGED"
+        die "Cannot install to $dest"
+    fi
+    STAGED=""
+}
+
 # --- Install from a GitHub release ---
 install_prebuilt() {
     local target
@@ -206,7 +227,7 @@ install_prebuilt() {
     asset="git-session-${target}.tar.gz"
 
     tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' EXIT
+    trap 'rm -rf "$tmp" "$STAGED"' EXIT
 
     info "Downloading ${asset} (${VERSION})..."
     if ! download "${base}/${asset}" "${tmp}/${asset}"; then
@@ -243,17 +264,12 @@ install_prebuilt() {
     ok "Checksum verified"
 
     info "Installing to $INSTALL_DIR..."
-    mkdir -p "$INSTALL_DIR" || { error "Cannot create $INSTALL_DIR"; exit 1; }
 
     if ! tar -xzf "${tmp}/${asset}" -C "$tmp" "$BINARY_NAME"; then
         die "Failed to extract ${asset}."
     fi
 
-    cp "${tmp}/${BINARY_NAME}" "$INSTALL_DIR/$BINARY_NAME" || {
-        error "Cannot copy to $INSTALL_DIR/$BINARY_NAME"
-        exit 1
-    }
-    chmod +x "$INSTALL_DIR/$BINARY_NAME"
+    install_binary "${tmp}/${BINARY_NAME}"
 
     trap - EXIT
     rm -rf "$tmp"
@@ -287,9 +303,9 @@ build_from_source() {
     # `curl ... | bash -s -- --from-source` works from anywhere.
     local src_dir="$PWD"
     local clone_dir=""
+    trap 'rm -rf "$clone_dir" "$STAGED"' EXIT
     if [ ! -f "build.zig" ] || [ ! -f "src/main.zig" ]; then
         clone_dir="$(mktemp -d)"
-        trap 'rm -rf "$clone_dir"' EXIT
         info "Cloning ${REPO}..."
         if ! git clone --depth 1 "https://github.com/${REPO}.git" "$clone_dir" >/dev/null 2>&1; then
             die "Could not clone ${REPO}. Run this script from the repository root to build from source."
@@ -309,15 +325,10 @@ build_from_source() {
     fi
 
     info "Installing to $INSTALL_DIR..."
-    mkdir -p "$INSTALL_DIR" || { error "Cannot create $INSTALL_DIR"; exit 1; }
-    cp "$build_output" "$INSTALL_DIR/$BINARY_NAME" || {
-        error "Cannot copy to $INSTALL_DIR/$BINARY_NAME"
-        exit 1
-    }
-    chmod +x "$INSTALL_DIR/$BINARY_NAME"
+    install_binary "$build_output"
 
+    trap - EXIT
     if [ -n "$clone_dir" ]; then
-        trap - EXIT
         rm -rf "$clone_dir"
     fi
 
