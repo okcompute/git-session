@@ -228,6 +228,52 @@ pub fn tmuxCountSessions(allocator: std.mem.Allocator, io: std.Io) usize {
     return count;
 }
 
+/// Splits `tmux list-sessions -F '#{session_name}'` output into one
+/// heap-allocated name per non-empty line. The caller owns the returned
+/// slice and every element.
+pub fn parseSessionNames(allocator: std.mem.Allocator, output: []const u8) ![][]u8 {
+    var list: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (list.items) |n| allocator.free(n);
+        list.deinit(allocator);
+    }
+    var it = std.mem.splitScalar(u8, output, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0) continue;
+        const name = try allocator.dupe(u8, line);
+        errdefer allocator.free(name);
+        try list.append(allocator, name);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// Returns the names of every tmux session, or an empty slice when tmux
+/// is not installed, no server is running, or on any error. The caller
+/// owns the returned slice and every element.
+pub fn tmuxListSessionNames(allocator: std.mem.Allocator, io: std.Io) [][]u8 {
+    const r = process.exec(allocator, io, &.{ "tmux", "list-sessions", "-F", "#{session_name}" }, null) catch return &.{};
+    defer process.freeExecResult(allocator, r);
+    if (!r.exited_ok) return &.{};
+    return parseSessionNames(allocator, r.stdout_data) catch &.{};
+}
+
+/// Returns `true` when `listed` (a name reported by tmux) is the session
+/// git-session would name `computed`. tmux stores `.` and `:` in session
+/// names as `_`, so both sides are compared with those characters folded.
+pub fn sessionNameMatches(listed: []const u8, computed: []const u8) bool {
+    if (listed.len != computed.len) return false;
+    for (listed, computed) |a, b| {
+        if (foldSessionChar(a) != foldSessionChar(b)) return false;
+    }
+    return true;
+}
+
+/// Maps the characters tmux rewrites in session names (`.`, `:`) to `_`.
+fn foldSessionChar(c: u8) u8 {
+    return if (c == '.' or c == ':') '_' else c;
+}
+
 /// Returns `true` when a tmux client is currently attached to the given
 /// session. Uses `tmux list-clients -t <session_name>` which only
 /// returns clients viewing that session. This is more reliable than
@@ -439,6 +485,47 @@ test "tmuxSessionName sanitizes dots in prefix" {
     const result = try tmuxSessionName(allocator, "fix-it", "bug.fix/fix-it", "app");
     defer allocator.free(result);
     try testing.expectEqualStrings("(app/bug_fix/) - fix-it", result);
+}
+
+test "parseSessionNames returns one name per non-empty line" {
+    const allocator = testing.allocator;
+    const names = try parseSessionNames(allocator, "(app) - one\n\n(app/feature/) - two\r\n");
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("(app) - one", names[0]);
+    try testing.expectEqualStrings("(app/feature/) - two", names[1]);
+}
+
+test "parseSessionNames handles empty output" {
+    const names = try parseSessionNames(testing.allocator, "");
+    defer testing.allocator.free(names);
+    try testing.expectEqual(@as(usize, 0), names.len);
+}
+
+test "parseSessionNames does not leak when an allocation fails" {
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+        if (parseSessionNames(allocator, "a\nb\nc\n")) |names| {
+            for (names) |n| allocator.free(n);
+            allocator.free(names);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+}
+
+test "sessionNameMatches folds the characters tmux rewrites" {
+    try testing.expect(sessionNameMatches("(my_app) - x", "(my.app) - x"));
+    try testing.expect(sessionNameMatches("(app) - a_b", "(app) - a:b"));
+    try testing.expect(sessionNameMatches("(app) - x", "(app) - x"));
+    try testing.expect(!sessionNameMatches("(app) - x", "(app) - y"));
+    try testing.expect(!sessionNameMatches("(app) - x", "(app) - xx"));
 }
 
 /// Asserts that `args` contains `-e` immediately followed by

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Rex support: git-session can drive the [Rex](https://www.superlogical.com/rex/docs.md) terminal app instead of tmux. Set `multiplexer = "rex"` in `~/.config/git-session/config.toml`. When the key is not set, Rex is picked automatically when git-session runs in a Rex terminal outside tmux. tmux remains the default and behaves as before. The same `[[window]]` entries create Rex tabs with the configured labels, start in the worktree, and get their commands typed into the shell. `GS_REPO_PATH` is set in each of those windows.
+- Rex sessions get a shorter label than tmux sessions, `<repository> · <session>` (e.g. `my-project · login-page`), because Rex's session picker clips long labels.
+- With Rex, `create` and `fix` offer to show the session in the Rex app (requires Remote Control in the app's settings). `remove` and `remove-repo` stop running programs and kill the Rex session last, as with tmux.
+- With Rex, git-session never starts a Rex server. When the Rex app is not running it prints a clear error and exits with status 4 before changing anything.
+- `git-session config` now also prints the `multiplexer` setting.
+- The TUI remove and fix lists tag each session with where it is running: `[tmux]`, `[Rex]`, or both.
+- `remove` and `remove-repo` also clean up a session left in the other multiplexer after switching between tmux and Rex.
+
 ## [1.0.1] - 2026-10-21
 
 ### Fixed
@@ -37,5 +49,6 @@ Initial public release.
 - Prebuilt release binaries for Linux and macOS, published as GitHub Release assets alongside a `SHA256SUMS` checksum file. Pushing a `v*` tag builds and publishes them through the `Release` workflow, and the assets are served via GitHub's CDN.
 - `install.sh` downloads the matching release binary by default (verifying its SHA-256 checksum) and falls back to building from source when no prebuilt binary is available. New options: `--version <tag>` to pick a release and `--from-source` to force a source build.
 
+[Unreleased]: https://github.com/okcompute/git-session/compare/v1.0.1...HEAD
 [1.0.1]: https://github.com/okcompute/git-session/releases/tag/v1.0.1
 [1.0.0]: https://github.com/okcompute/git-session/releases/tag/v1.0.0

@@ -6,7 +6,7 @@ const config = @import("config.zig");
 const term = @import("term.zig");
 const repo = @import("repo.zig");
 const git = @import("git.zig");
-const tmux = @import("tmux.zig");
+const mux = @import("mux.zig");
 const process = @import("process.zig");
 const usage = @import("usage.zig");
 const branch_validate = @import("git_branch_validate.zig");
@@ -94,6 +94,8 @@ pub const TuiApp = struct {
     io: std.Io,
     env: *std.process.Environ.Map,
     app_config: config.AppConfig,
+    /// Terminal multiplexer backend (tmux or Rex) driving the sessions.
+    multiplexer: mux.Mux,
     screen: Screen = .main_menu,
 
     // Repo list state
@@ -105,6 +107,10 @@ pub const TuiApp = struct {
 
     // Worktree list for remove/fix
     worktrees: std.ArrayList([]u8) = .empty,
+    /// Where each entry of `worktrees` (same index) has a live terminal
+    /// session, shown as a `[tmux]` / `[Rex]` tag in the remove/fix lists.
+    /// May be shorter than `worktrees` if computing it failed.
+    worktree_presence: std.ArrayList(mux.Presence) = .empty,
     selected_worktree_idx: u32 = 0,
 
     // Sub-menu cursor
@@ -173,7 +179,7 @@ pub const TuiApp = struct {
     worker_rm_session_name: ?[]const u8 = null,
     worker_rm_branch_name: ?[]const u8 = null,
     worker_rm_bare_repo_path: ?[]const u8 = null,
-    worker_rm_tmux_name: ?[]const u8 = null,
+    worker_rm_repo_name: ?[]const u8 = null,
 
     // Remove-repository flow state. The target is captured on the main
     // thread when the user presses `D` so the confirmation screen knows
@@ -200,22 +206,24 @@ pub const TuiApp = struct {
 
     /// Heap-allocates a `TuiApp`, initialises all text fields and loads
     /// the repository list from the configured root folders.
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, app_config: config.AppConfig) !*TuiApp {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, app_config: config.AppConfig, multiplexer: mux.Mux) !*TuiApp {
         const self = try allocator.create(TuiApp);
         // Capture tmux client identity first, then query the session
         // through the same code path used by hasUserSwitchedAway() to
-        // guarantee identical string formatting.
-        const client_name = tmux.tmuxGetClientName(allocator, io, env);
+        // guarantee identical string formatting. Both are null with Rex,
+        // which does not report which session its app is showing.
+        const client_name = multiplexer.clientName(allocator, io, env);
         const original_session = if (client_name) |cn|
-            tmux.tmuxGetClientSession(allocator, io, cn)
+            multiplexer.clientSession(allocator, io, cn)
         else
-            tmux.tmuxGetCurrentSession(allocator, io, env);
+            multiplexer.currentSession(allocator, io, env);
 
         self.* = .{
             .allocator = allocator,
             .io = io,
             .env = env,
             .app_config = app_config,
+            .multiplexer = multiplexer,
             .spinner = .{ .io = io, .style = style.title },
             .input_session_name = vxfw.TextField.init(allocator),
             .input_general = vxfw.TextField.init(allocator),
@@ -281,6 +289,8 @@ pub const TuiApp = struct {
         for (self.worktrees.items) |name| self.allocator.free(name);
         self.worktrees.deinit(self.allocator);
         self.worktrees = .empty;
+        self.worktree_presence.deinit(self.allocator);
+        self.worktree_presence = .empty;
     }
 
     /// Reloads the repository list from all configured root folders,
@@ -306,7 +316,45 @@ pub const TuiApp = struct {
         if (self.selected_repo) |sr| {
             self.worktrees = try repo.listWorktrees(self.allocator, self.io, sr.root);
             self.selected_worktree_idx = 0;
+            self.refreshWorktreePresence(sr);
         }
+    }
+
+    /// Fills `worktree_presence` with where each worktree has a live
+    /// session, using one session listing per multiplexer. Best-effort:
+    /// on failure the list is left short and rows show no tag.
+    fn refreshWorktreePresence(self: *TuiApp, sr: repo.SelectedRepo) void {
+        const backends = mux.Backends.init(self.multiplexer, self.allocator, self.io, self.env);
+        defer backends.deinit(self.allocator);
+        const index = mux.SessionIndex.load(backends, self.allocator, self.io);
+        defer index.deinit(self.allocator);
+
+        const bare_repo_path = std.fmt.allocPrint(self.allocator, "{s}/{s}.git", .{ sr.root, sr.config.bare_repo }) catch return;
+        defer self.allocator.free(bare_repo_path);
+
+        for (self.worktrees.items) |wt| {
+            const branch = self.worktreeBranch(sr.root, bare_repo_path, wt);
+            defer if (branch) |b| self.allocator.free(b);
+            const p: mux.Presence = if (branch) |b|
+                index.presence(self.allocator, .{ .worktree = wt, .branch = b, .repo_name = sr.name })
+            else
+                .{};
+            self.worktree_presence.append(self.allocator, p) catch return;
+        }
+    }
+
+    /// Returns the branch of worktree `name`: from its session file, else
+    /// asked from git. Caller owns the result; `null` when unknown.
+    fn worktreeBranch(self: *TuiApp, repo_root: []const u8, bare_repo_path: []const u8, name: []const u8) ?[]const u8 {
+        const info = repo.parseSessionFile(self.allocator, self.io, bare_repo_path, name) catch repo.SessionInfo{ .branch = "", .branch_name = "" };
+        defer {
+            if (info.branch.len > 0) self.allocator.free(info.branch);
+            if (info.branch_name.len > 0) self.allocator.free(info.branch_name);
+        }
+        if (info.branch_name.len > 0) return self.allocator.dupe(u8, info.branch_name) catch null;
+        const wt_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ repo_root, name }) catch return null;
+        defer self.allocator.free(wt_path);
+        return git.gitWorktreeBranch(self.allocator, self.io, wt_path);
     }
 
     /// Opens a repository by loading its config and transitions to the
@@ -353,11 +401,11 @@ pub const TuiApp = struct {
         if (self.worker_rm_session_name) |s| self.allocator.free(s);
         if (self.worker_rm_branch_name) |s| self.allocator.free(s);
         if (self.worker_rm_bare_repo_path) |s| self.allocator.free(s);
-        if (self.worker_rm_tmux_name) |s| self.allocator.free(s);
+        if (self.worker_rm_repo_name) |s| self.allocator.free(s);
         self.worker_rm_session_name = null;
         self.worker_rm_branch_name = null;
         self.worker_rm_bare_repo_path = null;
-        self.worker_rm_tmux_name = null;
+        self.worker_rm_repo_name = null;
 
         if (self.worker_rr_repo_name) |s| self.allocator.free(s);
         if (self.worker_rr_root) |s| self.allocator.free(s);
@@ -379,7 +427,7 @@ pub const TuiApp = struct {
     fn hasUserSwitchedAway(self: *TuiApp) bool {
         const client = self.tmux_client_name orelse return false;
         const original = self.tmux_original_session orelse return false;
-        const current = tmux.tmuxGetClientSession(self.allocator, self.io, client) orelse return false;
+        const current = self.multiplexer.clientSession(self.allocator, self.io, client) orelse return false;
         defer self.allocator.free(current);
         return !std.mem.eql(u8, current, original);
     }
@@ -484,7 +532,7 @@ pub const TuiApp = struct {
                         // of the TUI prompt (which they can't see).
                         if (self.worker_next_screen == .attach_confirm and self.hasUserSwitchedAway()) {
                             if (self.pending_tmux_name) |tmux_name| {
-                                tmux.tmuxDisplayPopup(self.allocator, self.io, tmux_name, self.tmux_client_name);
+                                self.multiplexer.displayPopup(self.allocator, self.io, tmux_name, self.tmux_client_name);
                             }
                             ctx.quit = true;
                             ctx.redraw = true;
@@ -538,9 +586,19 @@ pub const TuiApp = struct {
                     .working => {}, // ignore keypresses while working
                     .attach_confirm => {
                         if (key.matches('y', .{}) or key.matches(vaxis.Key.enter, .{})) {
-                            // Attach to tmux session, then quit
+                            // Attach to tmux session (or show it in the Rex app), then quit
                             if (self.pending_tmux_name) |tmux_name| {
-                                tmux.tmuxAttachOrSwitch(self.allocator, self.io, self.env, tmux_name) catch {};
+                                self.multiplexer.attachOrSwitch(self.allocator, self.io, self.env, tmux_name) catch {
+                                    // tmux attach errors were always ignored. Rex's
+                                    // printed hint is muted while the TUI runs, so
+                                    // surface it as a message instead.
+                                    if (self.multiplexer == .rex) {
+                                        self.setMessage("Could not show the session in Rex. Turn on Remote Control in the Rex app's settings, or pick the session in the Rex sidebar.", true);
+                                        self.quit_on_dismiss = true;
+                                        self.screen = .message;
+                                        return ctx.consumeAndRedraw();
+                                    }
+                                };
                             }
                             ctx.quit = true;
                             return ctx.consumeAndRedraw();
@@ -1260,27 +1318,34 @@ pub const TuiApp = struct {
             return;
         };
 
+        const is_rex = self.multiplexer == .rex;
         if (self.worker_progress) |progress| {
-            progress.appendLine("Creating tmux session...");
+            progress.appendLine(if (is_rex) "Creating Rex session..." else "Creating tmux session...");
         }
 
-        // Create tmux session
+        // Create tmux (or Rex) session
         const wt_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ repo_root, name }) catch {
             self.worker_error = self.allocator.dupe(u8, "Allocation failure") catch null;
             return;
         };
         defer self.allocator.free(wt_path);
-        const tmux_name = tmux.tmuxSessionName(self.allocator, name, branch_name, sr_name) catch {
-            self.worker_error = self.allocator.dupe(u8, "Failed to generate tmux name") catch null;
+        const tmux_name = self.multiplexer.sessionName(self.allocator, name, branch_name, sr_name) catch {
+            self.worker_error = self.allocator.dupe(u8, if (is_rex) "Failed to generate Rex session name" else "Failed to generate tmux name") catch null;
             return;
         };
         defer self.allocator.free(tmux_name);
-        tmux.tmuxCreateSession(self.allocator, self.io, tmux_name, wt_path, self.worker_windows) catch {
+        self.multiplexer.createSession(self.allocator, self.io, self.env, tmux_name, wt_path, self.worker_windows) catch |err| {
             // Roll back: remove the worktree and session file so the
             // user doesn't end up with an orphaned, half-created session.
             _ = git.gitRemoveWorktree(self.allocator, self.io, bare_repo_path, name) catch {};
             repo.deleteSessionFile(self.allocator, self.io, bare_repo_path, name);
-            self.worker_error = self.allocator.dupe(u8, "Failed to create tmux session") catch null;
+            const msg = if (err == error.RexServerNotRunning)
+                "Failed to create Rex session: the Rex server is not running. Open the Rex app and try again."
+            else if (is_rex)
+                "Failed to create Rex session"
+            else
+                "Failed to create tmux session";
+            self.worker_error = self.allocator.dupe(u8, msg) catch null;
             return;
         };
 
@@ -1303,13 +1368,13 @@ pub const TuiApp = struct {
             const notify_msg = std.fmt.allocPrint(self.allocator, "[git-session] Removal failed: {s}", .{err_msg}) catch null;
             if (notify_msg) |msg| {
                 defer self.allocator.free(msg);
-                tmux.tmuxNotify(self.allocator, self.io, msg, 5000, self.tmux_client_name);
+                self.multiplexer.notify(self.allocator, self.io, msg, 5000, self.tmux_client_name);
             }
         } else {
             const notify_msg = std.fmt.allocPrint(self.allocator, "[git-session] Session removed: {s}", .{session_name}) catch null;
             if (notify_msg) |msg| {
                 defer self.allocator.free(msg);
-                tmux.tmuxNotify(self.allocator, self.io, msg, 5000, self.tmux_client_name);
+                self.multiplexer.notify(self.allocator, self.io, msg, 5000, self.tmux_client_name);
             }
         }
         ctx.quit = true;
@@ -1352,13 +1417,8 @@ pub const TuiApp = struct {
             return;
         }
 
-        if (branch_name) |bn| {
-            self.worker_rm_branch_name = bn;
-            self.worker_rm_tmux_name = tmux.tmuxSessionName(self.allocator, session_name, bn, sr.name) catch null;
-        } else {
-            self.worker_rm_branch_name = null;
-            self.worker_rm_tmux_name = null;
-        }
+        self.worker_rm_branch_name = branch_name;
+        self.worker_rm_repo_name = if (branch_name != null) self.allocator.dupe(u8, sr.name) catch null else null;
 
         // If the user has switched to another tmux session, perform the
         // removal synchronously, show an ephemeral notification on their
@@ -1405,45 +1465,33 @@ pub const TuiApp = struct {
         const session_name = self.worker_rm_session_name orelse return error.MissingSnapshot;
         const bare_repo_path = self.worker_rm_bare_repo_path orelse return error.MissingSnapshot;
 
+        const ref: ?mux.SessionRef = if (self.worker_rm_branch_name) |bn| blk: {
+            const repo_name = self.worker_rm_repo_name orelse break :blk null;
+            break :blk .{ .worktree = session_name, .branch = bn, .repo_name = repo_name };
+        } else null;
+
+        // The worktree may also have a session in the other multiplexer
+        // (created before the user switched backends); clean up both.
+        const backends = mux.Backends.init(self.multiplexer, self.allocator, self.io, self.env);
+        defer backends.deinit(self.allocator);
+
         // Switch the user away from the session being removed so they
         // are not dropped to a bare terminal when we kill it later.
         // This does NOT kill the session -- our process keeps running.
-        if (self.worker_rm_tmux_name) |tmux_name| {
-            tmux.tmuxSwitchAwayIfCurrent(self.allocator, self.io, self.env, tmux_name);
-        }
+        if (ref) |r| backends.switchAway(self.allocator, self.io, self.env, r);
 
         // Kill the tmux session as the very last step, even on early
         // return. When removing the active session this terminates our
         // own process, so all git cleanup must complete first. Using
         // `defer` guarantees the kill runs even when git operations
         // fail, preventing a zombie tmux session the user can't see.
-        defer {
-            if (self.worker_rm_tmux_name) |tmux_name| {
-                if (tmux.tmuxSessionExists(self.allocator, self.io, tmux_name)) {
-                    tmux.tmuxKillSession(self.allocator, self.io, tmux_name) catch {};
-                }
-            }
-        }
+        defer if (ref) |r| backends.killSessions(self.allocator, self.io, self.env, r);
 
-        // Wait briefly for any processes in the tmux session (editors,
-        // shells) to notice the client detached. This gives them a
-        // chance to release the worktree directory before we remove it.
-        // The tmux session is still alive at this point (killed in
-        // defer above), but without a client attached, well-behaved
-        // programs will start to wind down.
-        if (self.worker_rm_tmux_name) |tmux_name| {
-            if (tmux.tmuxSessionExists(self.allocator, self.io, tmux_name)) {
-                // Send C-c and 'exit' to all panes to encourage
-                // processes to release the worktree directory.
-                tmux.tmuxSendExitToAllPanes(self.allocator, self.io, tmux_name);
-
-                var attempts: u8 = 0;
-                while (attempts < 10) : (attempts += 1) {
-                    if (!tmux.tmuxSessionExists(self.allocator, self.io, tmux_name)) break;
-                    self.io.sleep(.fromMilliseconds(50), .awake) catch {};
-                }
-            }
-        }
+        // Send C-c and 'exit' to all panes to encourage processes to
+        // release the worktree directory, and wait briefly for them.
+        // The sessions are still alive at this point (killed in the
+        // defer above).
+        if (ref) |r| backends.stopAndWait(self.allocator, self.io, self.env, r);
 
         // Remove the git worktree.
         const wt_err = git.gitRemoveWorktree(self.allocator, self.io, bare_repo_path, session_name) catch {
@@ -1503,15 +1551,22 @@ pub const TuiApp = struct {
                 self.screen = .message;
                 return;
             };
-        const tmux_name = try tmux.tmuxSessionName(self.allocator, session_name, branch_for_name, sr.name);
+        const tmux_name = try self.multiplexer.sessionName(self.allocator, session_name, branch_for_name, sr.name);
         defer self.allocator.free(tmux_name);
 
-        try tmux.tmuxCreateSession(self.allocator, self.io, tmux_name, wt_path, sr.config.windows.items);
+        self.multiplexer.createSession(self.allocator, self.io, self.env, tmux_name, wt_path, sr.config.windows.items) catch |err| {
+            if (err == error.RexServerNotRunning) {
+                self.setMessage("Failed to fix session: the Rex server is not running. Open the Rex app and try again.", true);
+                self.screen = .message;
+                return;
+            }
+            return err;
+        };
 
         // If the user switched away, show a popup on their current
         // client instead of the TUI attach-confirm screen.
         if (self.hasUserSwitchedAway()) {
-            tmux.tmuxDisplayPopup(self.allocator, self.io, tmux_name, self.tmux_client_name);
+            self.multiplexer.displayPopup(self.allocator, self.io, tmux_name, self.tmux_client_name);
             ctx.quit = true;
             return ctx.consumeAndRedraw();
         }
@@ -1722,7 +1777,10 @@ pub const TuiApp = struct {
         };
         defer self.allocator.free(bare_repo_path);
 
-        // Tear down each tmux session before nuking the directory tree.
+        // Tear down each session, in both multiplexers, before nuking the
+        // directory tree.
+        const backends = mux.Backends.init(self.multiplexer, self.allocator, self.io, self.env);
+        defer backends.deinit(self.allocator);
         for (sessions) |session_name| {
             const info = repo.parseSessionFile(self.allocator, self.io, bare_repo_path, session_name) catch
                 repo.SessionInfo{ .branch = "", .branch_name = "" };
@@ -1740,25 +1798,11 @@ pub const TuiApp = struct {
             };
             defer if (branch_name) |bn| self.allocator.free(bn);
 
-            const tmux_name: ?[]u8 = if (branch_name) |bn|
-                tmux.tmuxSessionName(self.allocator, session_name, bn, repo_name) catch null
-            else
-                null;
-            defer if (tmux_name) |tn| self.allocator.free(tn);
-
-            if (tmux_name) |tn| {
-                tmux.tmuxSwitchAwayIfCurrent(self.allocator, self.io, self.env, tn);
-                if (tmux.tmuxSessionExists(self.allocator, self.io, tn)) {
-                    tmux.tmuxSendExitToAllPanes(self.allocator, self.io, tn);
-                    var attempts: u8 = 0;
-                    while (attempts < 10) : (attempts += 1) {
-                        if (!tmux.tmuxSessionExists(self.allocator, self.io, tn)) break;
-                        self.io.sleep(.fromMilliseconds(50), .awake) catch {};
-                    }
-                    if (tmux.tmuxSessionExists(self.allocator, self.io, tn)) {
-                        tmux.tmuxKillSession(self.allocator, self.io, tn) catch {};
-                    }
-                }
+            if (branch_name) |bn| {
+                const ref: mux.SessionRef = .{ .worktree = session_name, .branch = bn, .repo_name = repo_name };
+                backends.switchAway(self.allocator, self.io, self.env, ref);
+                backends.stopAndWait(self.allocator, self.io, self.env, ref);
+                backends.killSessions(self.allocator, self.io, self.env, ref);
             }
         }
 
@@ -2284,7 +2328,10 @@ pub const TuiApp = struct {
         child_idx += 1;
 
         const warning: vxfw.Text = .{
-            .text = "  This deletes the repo directory, ALL sessions, tmux sessions, and config.",
+            .text = if (self.multiplexer == .rex)
+                "  This deletes the repo directory, ALL sessions, Rex sessions, and config."
+            else
+                "  This deletes the repo directory, ALL sessions, tmux sessions, and config.",
             .style = style.danger,
             .width_basis = .parent,
         };
@@ -2354,7 +2401,12 @@ pub const TuiApp = struct {
             const is_sel = i == self.selected_worktree_idx;
             const ind = if (is_sel) "  > " else "    ";
             const s = if (is_sel) style.selected else style.normal;
-            const lbl = term.truncateLabel(arena, ind, wt_name, list_width) catch "?";
+            // The `[tmux]` / `[Rex]` tag is reserved first so truncation
+            // shortens the name, never the tag.
+            const tag = if (i < self.worktree_presence.items.len) self.worktree_presence.items[i].tag() else "";
+            const name_width: u16 = if (list_width > tag.len) list_width - @as(u16, @intCast(tag.len)) else 0;
+            const name_lbl = term.truncateLabel(arena, ind, wt_name, name_width) catch "?";
+            const lbl = std.fmt.allocPrint(arena, "{s}{s}", .{ name_lbl, tag }) catch name_lbl;
             const t: vxfw.Text = .{ .text = lbl, .style = s, .width_basis = .parent };
             children[child_idx] = .{ .origin = .{ .row = row, .col = 0 }, .surface = t.draw(ctx.withConstraints(.{}, ctx.max)) catch return emptyWidget(arena) };
             row += 1;
@@ -2649,13 +2701,14 @@ pub const TuiApp = struct {
             .surface = msg.draw(ctx.withConstraints(.{}, ctx.max)) catch return emptyWidget(arena),
         };
 
-        const prompt: vxfw.Text = .{ .text = "  Attach to session? (y/n)", .style = style.input_label, .width_basis = .parent };
+        const is_rex = self.multiplexer == .rex;
+        const prompt: vxfw.Text = .{ .text = if (is_rex) "  Show session in Rex? (y/n)" else "  Attach to session? (y/n)", .style = style.input_label, .width_basis = .parent };
         children[1] = .{
             .origin = .{ .row = 4, .col = 0 },
             .surface = prompt.draw(ctx.withConstraints(.{}, ctx.max)) catch return emptyWidget(arena),
         };
 
-        const hint: vxfw.Text = .{ .text = "  y: attach and quit  n/esc: quit without attaching", .style = style.dimmed, .width_basis = .parent };
+        const hint: vxfw.Text = .{ .text = if (is_rex) "  y: show it and quit  n/esc: quit (the session stays in the Rex sidebar)" else "  y: attach and quit  n/esc: quit without attaching", .style = style.dimmed, .width_basis = .parent };
         children[2] = .{
             .origin = .{ .row = 6, .col = 0 },
             .surface = hint.draw(ctx.withConstraints(.{}, ctx.max)) catch return emptyWidget(arena),
@@ -2774,8 +2827,8 @@ fn emptyWidget(arena: std.mem.Allocator) vxfw.Widget {
 /// starts at the corresponding screen with any supplied `session`,
 /// `branch`, and `prefix` values pre-filled, skipping wizard steps that
 /// are already resolved.
-pub fn runTui(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, app_config: config.AppConfig, cli_args: CliArgs) !void {
-    const tui_app = try TuiApp.init(allocator, io, env, app_config);
+pub fn runTui(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, app_config: config.AppConfig, multiplexer: mux.Mux, cli_args: CliArgs) !void {
+    const tui_app = try TuiApp.init(allocator, io, env, app_config, multiplexer);
     defer tui_app.deinit();
 
     // Pre-select repository when provided.

@@ -1,18 +1,18 @@
 # git-session
 
-A TUI tool for managing Git worktree-based development sessions with TMUX. Written in Zig.
+A TUI tool for managing Git worktree-based development sessions with TMUX (or [Rex](https://www.superlogical.com/rex/docs.md)). Written in Zig.
 
 git-session handles:
 
 - Creating Git worktrees from configured base branches
-- Setting up TMUX sessions with customizable window layouts
+- Setting up TMUX (or Rex) sessions with customizable window layouts
 - Cleaning up worktrees, branches, and TMUX sessions
 - Reattaching to existing sessions
 
 ## Requirements
 
 - Git (>= 2.42 to create sessions in empty repositories)
-- TMUX (>= 3.0)
+- TMUX (>= 3.0), or the Rex app (macOS, public beta) with the `rex` CLI on `PATH` when using Rex. See [Using Rex](docs/configuration.md#using-rex).
 
 [Zig](https://ziglang.org/) 0.16+ is required only when building from source.
 
@@ -180,10 +180,12 @@ Stored at `~/.config/git-session/config.toml`:
 ```toml
 roots = ["/Users/you/Developer/Git", "/opt/Projects"]
 default_branch_prefixes = ["feature", "bugfix", "chore", "refactor", "docs", "test"]
+multiplexer = "tmux"
 ```
 
 - `roots` — the root folders under which managed repositories are stored.
 - `default_branch_prefixes` — the branch prefixes proposed by the add-repo flow (both the TUI wizard and the CLI `--prefix` default) when adding a new repository. Edit this list to customize the template applied to new repos. If the key is omitted, git-session falls back to the standard list shown above. Both a TOML array (`["feature", "bugfix"]`) and a quoted comma-separated string (`"feature,bugfix"`) are accepted.
+- `multiplexer` — `"tmux"` (default) or `"rex"`. Optional. When omitted, git-session uses Rex if it runs in a Rex terminal outside tmux, and tmux otherwise. The same `[[window]]` entries drive both. Rex needs the Rex app running and the `rex` CLI on `PATH`; see [Terminal multiplexer](docs/configuration.md#terminal-multiplexer).
 
 ## Contributing
 

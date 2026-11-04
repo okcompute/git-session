@@ -5,6 +5,7 @@ const config = @import("config.zig");
 const repo = @import("repo.zig");
 const git = @import("git.zig");
 const tmux = @import("tmux.zig");
+const mux = @import("mux.zig");
 const validate = @import("git_branch_validate.zig");
 const args_mod = @import("cli_args.zig");
 
@@ -30,7 +31,7 @@ pub fn printUsage(io: std.Io) void {
         \\  (none)              Interactive session manager (TUI)
         \\  create              Create a new session
         \\  remove              Remove an existing session
-        \\  fix                 Fix a session (recreate its tmux session)
+        \\  fix                 Fix a session (recreate its tmux or Rex session)
         \\  add-repo            Add (clone) a new repository
         \\  remove-repo         Remove a repository (deletes directory and all sessions)
         \\  config              Show current configuration
@@ -94,6 +95,13 @@ pub fn handleConfigCommand(allocator: std.mem.Allocator, io: std.Io, env: *const
             for (cfg.default_branch_prefixes.items, 1..) |prefix, i| {
                 term.print(io, "  {d}. {s}\n", .{ i, prefix });
             }
+        }
+
+        term.print(io, "\nMultiplexer:\n", .{});
+        if (cfg.multiplexer) |m| {
+            term.print(io, "  {s}\n", .{m});
+        } else {
+            term.print(io, "  (not set: tmux, or Rex when run from a Rex terminal outside tmux)\n", .{});
         }
         return;
     }
@@ -317,6 +325,14 @@ fn removeRootAndOptionallyContents(
     var entries = repo.listAllRepositories(allocator, io, env, &single_root, true) catch std.ArrayList(repo.RepoEntry).empty;
     defer repo.freeRepoEntries(allocator, &entries);
 
+    // `config` runs before main selects the multiplexer, so pick it here,
+    // only when there are repositories whose sessions may need tearing down.
+    var multiplexer: ?mux.Mux = null;
+    defer if (multiplexer) |m| m.deinit(allocator);
+    if (entries.items.len > 0) {
+        multiplexer = mux.Mux.initOrExit(allocator, io, env, cfg.multiplexer);
+    }
+
     var should_delete_repos = false;
     if (entries.items.len > 0) {
         if (assume_yes) {
@@ -326,7 +342,7 @@ fn removeRootAndOptionallyContents(
             for (entries.items, 1..) |e, n| {
                 term.print(io, "  {d}. {s}\n", .{ n, e.name });
             }
-            term.print(io, "\nAlso remove these repositories and their tmux sessions? [y/N] ", .{});
+            term.print(io, "\nAlso remove these repositories and their {s} sessions? [y/N] ", .{multiplexer.?.displayName()});
             var buf: [8]u8 = undefined;
             const input = term.readLine(io, &buf) catch "";
             should_delete_repos = input.len > 0 and (input[0] == 'y' or input[0] == 'Y');
@@ -337,6 +353,7 @@ fn removeRootAndOptionallyContents(
     }
 
     if (should_delete_repos) {
+        multiplexer.?.ensureReadyOrExit(allocator, io);
         for (entries.items) |entry| {
             const repo_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.root, entry.name }) catch {
                 term.eprint(io, "Warning: skipping '{s}' (allocation failure).\n", .{entry.name});
@@ -354,7 +371,7 @@ fn removeRootAndOptionallyContents(
             }
 
             term.print(io, "Removing repository '{s}'...\n", .{entry.name});
-            removeRepositoryFully(allocator, io, env, entry.name, entry.root, repo_root, worktrees.items) catch |err| {
+            removeRepositoryFully(allocator, io, env, multiplexer.?, entry.name, entry.root, repo_root, worktrees.items) catch |err| {
                 term.eprint(io, "Warning: failed to fully remove '{s}': {any}\n", .{ entry.name, err });
                 // Continue so other repos still get cleaned up.
             };
@@ -464,6 +481,7 @@ pub fn handleCreateCommand(
     io: std.Io,
     env: *const std.process.Environ.Map,
     app_config: config.AppConfig,
+    multiplexer: mux.Mux,
     cli_args: CliArgs,
 ) !?CliArgs {
     const repo_name = cli_args.repository orelse {
@@ -559,6 +577,7 @@ pub fn handleCreateCommand(
             allocator,
             io,
             env,
+            multiplexer,
             selected,
             cli_args.session.?,
             resolved_branch.?,
@@ -590,6 +609,7 @@ pub fn handleRemoveCommand(
     io: std.Io,
     env: *const std.process.Environ.Map,
     app_config: config.AppConfig,
+    multiplexer: mux.Mux,
     cli_args: CliArgs,
 ) !?CliArgs {
     const repo_name = cli_args.repository orelse {
@@ -605,7 +625,7 @@ pub fn handleRemoveCommand(
         var selected = (try repo.openRepo(allocator, io, env, entry.root, entry.name)) orelse std.process.exit(1);
         defer repo.freeSelectedRepo(allocator, &selected);
 
-        try runRemoveNonInteractive(allocator, io, env, selected, session_name);
+        try runRemoveNonInteractive(allocator, io, env, multiplexer, selected, session_name);
         return null;
     }
 
@@ -626,6 +646,7 @@ pub fn handleFixCommand(
     io: std.Io,
     env: *const std.process.Environ.Map,
     app_config: config.AppConfig,
+    multiplexer: mux.Mux,
     cli_args: CliArgs,
 ) !?CliArgs {
     const repo_name = cli_args.repository orelse {
@@ -641,7 +662,7 @@ pub fn handleFixCommand(
         var selected = (try repo.openRepo(allocator, io, env, entry.root, entry.name)) orelse std.process.exit(1);
         defer repo.freeSelectedRepo(allocator, &selected);
 
-        try runFixNonInteractive(allocator, io, env, selected, session_name);
+        try runFixNonInteractive(allocator, io, env, multiplexer, selected, session_name);
         return null;
     }
 
@@ -666,6 +687,7 @@ fn runCreateNonInteractive(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
+    multiplexer: mux.Mux,
     selected: repo.SelectedRepo,
     session_name: []const u8,
     base_branch: []const u8,
@@ -719,18 +741,18 @@ fn runCreateNonInteractive(
     const wt_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ selected.root, session_name });
     defer allocator.free(wt_path);
 
-    const tmux_name = try tmux.tmuxSessionName(allocator, session_name, branch_name, selected.name);
+    const tmux_name = try multiplexer.sessionName(allocator, session_name, branch_name, selected.name);
     defer allocator.free(tmux_name);
 
-    tmux.tmuxCreateSession(allocator, io, tmux_name, wt_path, selected.config.windows.items) catch {
+    multiplexer.createSession(allocator, io, env, tmux_name, wt_path, selected.config.windows.items) catch |err| {
         _ = git.gitRemoveWorktree(allocator, io, bare_repo_path, session_name) catch {};
         repo.deleteSessionFile(allocator, io, bare_repo_path, session_name);
-        term.eprint(io, "Error: failed to create tmux session.\n", .{});
-        std.process.exit(1);
+        term.eprint(io, "Error: failed to create {s} session.\n", .{multiplexer.displayName()});
+        std.process.exit(exitCodeFor(err));
     };
 
     term.print(io, "Session '{s}' created.\n", .{session_name});
-    offerAttach(allocator, io, env, tmux_name);
+    offerAttach(allocator, io, env, multiplexer, tmux_name);
 }
 
 /// Runs the full session-removal flow without TUI interaction.
@@ -743,6 +765,7 @@ fn runRemoveNonInteractive(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
+    multiplexer: mux.Mux,
     selected: repo.SelectedRepo,
     session_name: []const u8,
 ) !void {
@@ -795,35 +818,24 @@ fn runRemoveNonInteractive(
     };
     defer if (branch_name) |bn| allocator.free(bn);
 
-    const tmux_name: ?[]const u8 = if (branch_name) |bn|
-        tmux.tmuxSessionName(allocator, session_name, bn, selected.name) catch null
+    const ref: ?mux.SessionRef = if (branch_name) |bn|
+        .{ .worktree = session_name, .branch = bn, .repo_name = selected.name }
     else
         null;
-    defer if (tmux_name) |tn| allocator.free(tn);
+
+    // The worktree may also have a session in the other multiplexer (created
+    // before the user switched backends); clean up both.
+    const backends = mux.Backends.init(multiplexer, allocator, io, env);
+    defer backends.deinit(allocator);
 
     // Switch away from the session being removed so we're not killed mid-cleanup.
-    if (tmux_name) |tn| tmux.tmuxSwitchAwayIfCurrent(allocator, io, env, tn);
+    if (ref) |r| backends.switchAway(allocator, io, env, r);
 
-    // Kill the tmux session as the very last step (deferred).
-    defer {
-        if (tmux_name) |tn| {
-            if (tmux.tmuxSessionExists(allocator, io, tn)) {
-                tmux.tmuxKillSession(allocator, io, tn) catch {};
-            }
-        }
-    }
+    // Kill the multiplexer sessions as the very last step (deferred).
+    defer if (ref) |r| backends.killSessions(allocator, io, env, r);
 
     // Give processes inside the session a moment to release the directory.
-    if (tmux_name) |tn| {
-        if (tmux.tmuxSessionExists(allocator, io, tn)) {
-            tmux.tmuxSendExitToAllPanes(allocator, io, tn);
-            var attempts: u8 = 0;
-            while (attempts < 10) : (attempts += 1) {
-                if (!tmux.tmuxSessionExists(allocator, io, tn)) break;
-                io.sleep(.fromMilliseconds(50), .awake) catch {};
-            }
-        }
-    }
+    if (ref) |r| backends.stopAndWait(allocator, io, env, r);
 
     // Remove the git worktree.
     const wt_err = git.gitRemoveWorktree(allocator, io, bare_repo_path, session_name) catch {
@@ -862,6 +874,7 @@ pub fn handleRemoveRepoCommand(
     io: std.Io,
     env: *const std.process.Environ.Map,
     app_config: config.AppConfig,
+    multiplexer: mux.Mux,
     repo_name: []const u8,
     assume_yes: bool,
 ) !void {
@@ -898,7 +911,7 @@ pub fn handleRemoveRepoCommand(
         }
     }
 
-    try removeRepositoryFully(allocator, io, env, entry.name, entry.root, repo_root, worktrees.items);
+    try removeRepositoryFully(allocator, io, env, multiplexer, entry.name, entry.root, repo_root, worktrees.items);
 
     term.print(io, "Repository '{s}' removed.\n", .{entry.name});
 }
@@ -1087,10 +1100,10 @@ pub fn handleAddRepoCommand(
     term.print(io, "Repository '{s}' added at {s}.\n", .{ repo_name, repo_dir });
 }
 
-/// Performs the full repository removal: kills every tmux session for
-/// the repo, deletes the on-disk directory tree, and removes the
-/// centralized config file. Best-effort: tmux failures are tolerated
-/// (the session may not exist), but filesystem failures propagate.
+/// Performs the full repository removal: kills every tmux (or Rex)
+/// session for the repo, deletes the on-disk directory tree, and removes
+/// the centralized config file. Best-effort: multiplexer failures are
+/// tolerated (the session may not exist), but filesystem failures propagate.
 ///
 /// Used by both `handleRemoveRepoCommand` (single-repo CLI flow) and
 /// `handleConfigCommand` (when `remove-root` cascades into deleting
@@ -1099,6 +1112,7 @@ pub fn removeRepositoryFully(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
+    multiplexer: mux.Mux,
     repo_name: []const u8,
     root: []const u8,
     repo_root: []const u8,
@@ -1124,6 +1138,10 @@ pub fn removeRepositoryFully(
     const bare_repo_path = try std.fmt.allocPrint(allocator, "{s}/{s}.git", .{ repo_root, bare_repo_name });
     defer allocator.free(bare_repo_path);
 
+    // Sessions may live in either multiplexer; tear down both.
+    const backends = mux.Backends.init(multiplexer, allocator, io, env);
+    defer backends.deinit(allocator);
+
     for (worktrees) |session_name| {
         // Resolve the branch name to compute the tmux session name.
         const info = repo.parseSessionFile(allocator, io, bare_repo_path, session_name) catch
@@ -1142,27 +1160,13 @@ pub fn removeRepositoryFully(
         };
         defer if (branch_name) |bn| allocator.free(bn);
 
-        const tmux_name: ?[]u8 = if (branch_name) |bn|
-            tmux.tmuxSessionName(allocator, session_name, bn, repo_name) catch null
-        else
-            null;
-        defer if (tmux_name) |tn| allocator.free(tn);
-
-        if (tmux_name) |tn| {
+        if (branch_name) |bn| {
+            const ref: mux.SessionRef = .{ .worktree = session_name, .branch = bn, .repo_name = repo_name };
             // Switch the user away if they happen to be inside this
             // session, then ask processes to exit before we kill it.
-            tmux.tmuxSwitchAwayIfCurrent(allocator, io, env, tn);
-            if (tmux.tmuxSessionExists(allocator, io, tn)) {
-                tmux.tmuxSendExitToAllPanes(allocator, io, tn);
-                var attempts: u8 = 0;
-                while (attempts < 10) : (attempts += 1) {
-                    if (!tmux.tmuxSessionExists(allocator, io, tn)) break;
-                    io.sleep(.fromMilliseconds(50), .awake) catch {};
-                }
-                if (tmux.tmuxSessionExists(allocator, io, tn)) {
-                    tmux.tmuxKillSession(allocator, io, tn) catch {};
-                }
-            }
+            backends.switchAway(allocator, io, env, ref);
+            backends.stopAndWait(allocator, io, env, ref);
+            backends.killSessions(allocator, io, env, ref);
         }
     }
 
@@ -1186,6 +1190,7 @@ fn runFixNonInteractive(
     allocator: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
+    multiplexer: mux.Mux,
     selected: repo.SelectedRepo,
     session_name: []const u8,
 ) !void {
@@ -1248,31 +1253,55 @@ fn runFixNonInteractive(
             std.process.exit(1);
         };
 
-    const tmux_name = try tmux.tmuxSessionName(allocator, session_name, branch_for_name, selected.name);
+    const tmux_name = try multiplexer.sessionName(allocator, session_name, branch_for_name, selected.name);
     defer allocator.free(tmux_name);
 
-    term.print(io, "Recreating tmux session for '{s}'...\n", .{session_name});
-    tmux.tmuxCreateSession(allocator, io, tmux_name, wt_path, selected.config.windows.items) catch {
-        term.eprint(io, "Error: failed to create tmux session.\n", .{});
-        std.process.exit(1);
+    term.print(io, "Recreating {s} session for '{s}'...\n", .{ multiplexer.displayName(), session_name });
+    multiplexer.createSession(allocator, io, env, tmux_name, wt_path, selected.config.windows.items) catch |err| {
+        term.eprint(io, "Error: failed to create {s} session.\n", .{multiplexer.displayName()});
+        std.process.exit(exitCodeFor(err));
     };
 
     term.print(io, "Session '{s}' fixed.\n", .{session_name});
-    offerAttach(allocator, io, env, tmux_name);
+    offerAttach(allocator, io, env, multiplexer, tmux_name);
 }
 
-/// Offers to attach to `tmux_name` when running inside a tmux server.
-/// When not inside tmux, prints the attach command instead.
-fn offerAttach(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, tmux_name: []const u8) void {
-    if (tmux.isInsideTmux(env)) {
-        term.print(io, "Attach to session? [Y/n] ", .{});
-        var buf: [8]u8 = undefined;
-        const input = term.readLine(io, &buf) catch "";
-        if (input.len == 0 or input[0] == 'y' or input[0] == 'Y') {
-            tmux.tmuxAttachOrSwitch(allocator, io, env, tmux_name) catch {};
-        }
-    } else {
-        term.print(io, "To connect: tmux attach -t '{s}'\n", .{tmux_name});
+/// Process exit status for a failed multiplexer operation: 4 when the
+/// Rex server is not running (matching rex's own status), otherwise 1.
+fn exitCodeFor(err: anyerror) u8 {
+    return if (err == error.RexServerNotRunning) 4 else 1;
+}
+
+/// tmux: offers to attach to `tmux_name` when running inside a tmux
+/// server; when not inside tmux, prints the attach command instead.
+///
+/// Rex: there is no attach step (the Rex app is the viewer), so it always
+/// offers to show the session in the app, wherever git-session runs.
+fn offerAttach(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, multiplexer: mux.Mux, tmux_name: []const u8) void {
+    switch (multiplexer) {
+        .tmux => {
+            if (tmux.isInsideTmux(env)) {
+                term.print(io, "Attach to session? [Y/n] ", .{});
+                var buf: [8]u8 = undefined;
+                const input = term.readLine(io, &buf) catch "";
+                if (input.len == 0 or input[0] == 'y' or input[0] == 'Y') {
+                    tmux.tmuxAttachOrSwitch(allocator, io, env, tmux_name) catch {};
+                }
+            } else {
+                term.print(io, "To connect: tmux attach -t '{s}'\n", .{tmux_name});
+            }
+        },
+        .rex => {
+            term.print(io, "Show session in Rex? [Y/n] ", .{});
+            var buf: [8]u8 = undefined;
+            const input = term.readLine(io, &buf) catch "";
+            if (input.len == 0 or input[0] == 'y' or input[0] == 'Y') {
+                // Failures print their own hint (e.g. Remote Control off).
+                multiplexer.attachOrSwitch(allocator, io, env, tmux_name) catch {};
+            } else {
+                term.print(io, "Session '{s}' is in the Rex sidebar.\n", .{tmux_name});
+            }
+        },
     }
 }
 

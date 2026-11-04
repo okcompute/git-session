@@ -26,6 +26,10 @@ git-session config remove-root [<path>] [--yes | -y]
 | `help`, `--help`, `-h` | Print usage and exit. |
 | `--repository <name>` | (TUI mode) Pre-select a repository and open the TUI at its action menu. |
 
+## Terminal multiplexer
+
+Sessions run in tmux by default, or in [Rex](https://www.superlogical.com/rex/docs.md) when `multiplexer = "rex"` is set in `~/.config/git-session/config.toml` (or when git-session runs in a Rex terminal outside tmux and the key is not set). There is no command-line flag for it. Below, "tmux session" means "Rex session" when Rex is selected. See [Terminal multiplexer](configuration.md#terminal-multiplexer) for how the backend is chosen and what Rex requires.
+
 ## Session subcommands
 
 All three session subcommands require `--repository`. They run non-interactively when every piece of required information is available; otherwise the TUI opens at the earliest step that still needs user input.
@@ -79,9 +83,11 @@ git-session create --repository my-project --session login-page
 
 After creating a session you are offered the chance to attach to it (when running inside tmux). Outside tmux the attach command is printed to stdout.
 
+With Rex you are always asked `Show session in Rex? [Y/n]`. Answering yes asks the Rex app to show the session, which requires Remote Control to be turned on in the app's settings. If it isn't, git-session prints a hint and the session stays available in the Rex sidebar.
+
 ### `remove`
 
-Remove an existing session: worktree, branch, session file, and tmux session.
+Remove an existing session: worktree, branch, session file, and tmux session. A session for the worktree in the other multiplexer (tmux or Rex), left over from before you switched backends, is removed too.
 
 ```
 git-session remove --repository <name> [--session <name>]
@@ -102,11 +108,11 @@ git-session remove --repository my-project --session login-page
 git-session remove --repository my-project
 ```
 
-> **Note:** The tmux session is killed last, after the worktree and branch have been cleaned up, to ensure the git-session process finishes before tmux terminates it.
+> **Note:** The tmux session is killed last, after the worktree and branch have been cleaned up, to ensure the git-session process finishes before tmux terminates it. The same holds for Rex.
 
 ### `fix`
 
-Recreate the tmux session for an existing worktree (useful after a reboot or when the tmux server was restarted).
+Recreate the tmux (or Rex) session for an existing worktree (useful after a reboot or when the tmux server was restarted). When the session still exists it is left as is and you are offered to attach to it (or show it in Rex).
 
 ```
 git-session fix --repository <name> [--session <name>]
@@ -208,7 +214,7 @@ Config commands manage the list of root folders where git-session looks for repo
 
 ### `config`
 
-Print the currently configured root folders.
+Print the currently configured root folders, default branch prefixes, and `multiplexer` setting.
 
 ```bash
 git-session config
@@ -273,6 +279,10 @@ The last remaining root cannot be removed.
 | `add-repo` target directory already exists | Prints an error, exits with code 1 (no clone is attempted). |
 | `add-repo` clone failed | Prints an error, removes the partially-created directory, exits with code 1. |
 | Partial information provided (create / remove / fix) | Opens the TUI at the step where input is needed. |
+| Unknown `multiplexer` value in `config.toml` | Prints an error naming the value, exits with code 1. |
+| Rex selected but the `rex` CLI is not on `PATH` or in `$REX_BIN_DIR` | Prints an error explaining how to make it available, exits with code 1. |
+| Rex selected but the Rex server is not running (the app is not open) | Prints `the Rex server is not running`, exits with code 4. Applies to the TUI, `create`, `remove`, `fix`, and `remove-repo`, and nothing is changed on disk. |
+| Showing the session in Rex fails (Remote Control off) | Prints a hint; the session itself was created successfully (exit code 0). |
 
 ## TUI pre-selection
 

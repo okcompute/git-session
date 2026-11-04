@@ -7,6 +7,7 @@ const term = @import("term.zig");
 // Format:
 //   roots = ["/path/one", "/path/two"]
 //   default_branch_prefixes = ["feature", "bugfix", "chore", "refactor", "docs", "test"]
+//   multiplexer = "tmux"   # optional: "tmux" (default) or "rex"
 // ---------------------------------------------------------------------------
 
 /// The standard branch-prefix list proposed for newly added repositories
@@ -24,6 +25,11 @@ pub const AppConfig = struct {
     /// TUI). Populated from `default_branch_prefixes` in config.toml, or
     /// from `default_branch_prefixes_csv` when that key is absent.
     default_branch_prefixes: std.ArrayList([]const u8) = .empty,
+    /// Raw value of the `multiplexer` key ("tmux" or "rex"), or `null`
+    /// when the key is absent. Kept as the unvalidated string so that an
+    /// unknown value never makes the config unreadable (and is preserved
+    /// verbatim when the config is saved); `mux.chooseKind` validates it.
+    multiplexer: ?[]const u8 = null,
 };
 
 /// Appends the entries of `default_branch_prefixes_csv` to `list` as
@@ -319,6 +325,11 @@ pub fn parseAppConfig(allocator: std.mem.Allocator, contents: []const u8) !AppCo
             } else if (std.mem.eql(u8, key, "default_branch_prefixes")) {
                 freeArrayListOwned(allocator, &cfg.default_branch_prefixes);
                 cfg.default_branch_prefixes = try parseTomlArray(allocator, value_raw);
+            } else if (std.mem.eql(u8, key, "multiplexer")) {
+                if (cfg.multiplexer) |old| allocator.free(old);
+                cfg.multiplexer = null;
+                const value = parseTomlScalarString(value_raw);
+                if (value.len > 0) cfg.multiplexer = try allocator.dupe(u8, value);
             }
         }
     }
@@ -365,6 +376,10 @@ pub fn serializeAppConfig(allocator: std.mem.Allocator, cfg: AppConfig) ![]u8 {
 
     try appendTomlArrayLine(allocator, &out, "roots", cfg.roots.items);
     try appendTomlArrayLine(allocator, &out, "default_branch_prefixes", cfg.default_branch_prefixes.items);
+    if (cfg.multiplexer) |m| {
+        try writeKeyValue(&out, allocator, "multiplexer", m);
+        try out.append(allocator, '\n');
+    }
 
     return out.toOwnedSlice(allocator);
 }
@@ -405,6 +420,8 @@ fn freeArrayListOwned(allocator: std.mem.Allocator, list: *std.ArrayList([]const
 pub fn freeAppConfig(allocator: std.mem.Allocator, cfg: *AppConfig) void {
     freeArrayListOwned(allocator, &cfg.roots);
     freeArrayListOwned(allocator, &cfg.default_branch_prefixes);
+    if (cfg.multiplexer) |m| allocator.free(m);
+    cfg.multiplexer = null;
 }
 
 /// Runs the interactive first-run setup wizard. Prompts the user for a
@@ -537,6 +554,20 @@ pub fn generateRepoConfigToml(
 pub fn stripQuotes(s: []const u8) []const u8 {
     if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') return s[1 .. s.len - 1];
     return s;
+}
+
+/// Returns the string held by a scalar TOML value, borrowed from `raw`.
+/// A double-quoted value yields its content up to the closing quote, so a
+/// trailing `# comment` is ignored; an unquoted value is cut at the first
+/// `#` and trimmed.
+pub fn parseTomlScalarString(raw: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    if (trimmed.len > 0 and trimmed[0] == '"') {
+        if (std.mem.indexOfScalarPos(u8, trimmed, 1, '"')) |end| return trimmed[1..end];
+        return trimmed[1..];
+    }
+    const end = std.mem.indexOfScalar(u8, trimmed, '#') orelse trimmed.len;
+    return std.mem.trim(u8, trimmed[0..end], " \t");
 }
 
 /// Parses a TOML value into an `ArrayList` of heap-duplicated, unquoted
@@ -1229,6 +1260,98 @@ test "serializeAppConfig emits roots and default_branch_prefixes lines" {
 
     try testing.expect(std.mem.indexOf(u8, out, "roots = [\"/Users/me/Dev\"]") != null);
     try testing.expect(std.mem.indexOf(u8, out, "default_branch_prefixes = [\"feature\", \"bugfix\"]") != null);
+}
+
+test "parseAppConfig leaves multiplexer null when the key is absent" {
+    const allocator = testing.allocator;
+    var cfg = try parseAppConfig(allocator, "roots = [\"/a\"]\n");
+    defer freeAppConfig(allocator, &cfg);
+    try testing.expect(cfg.multiplexer == null);
+}
+
+test "parseAppConfig reads multiplexer" {
+    const allocator = testing.allocator;
+    var cfg = try parseAppConfig(allocator, "roots = [\"/a\"]\nmultiplexer = \"rex\"\n");
+    defer freeAppConfig(allocator, &cfg);
+    try testing.expectEqualStrings("rex", cfg.multiplexer.?);
+}
+
+test "parseAppConfig keeps an unknown multiplexer value instead of failing" {
+    // Validation happens when the backend is chosen; a bad value must not
+    // make the whole config unreadable (callers treat that as "no config").
+    const allocator = testing.allocator;
+    var cfg = try parseAppConfig(allocator, "roots = [\"/a\"]\nmultiplexer = \"screen\"\n");
+    defer freeAppConfig(allocator, &cfg);
+    try testing.expectEqualStrings("screen", cfg.multiplexer.?);
+}
+
+test "parseAppConfig: duplicate multiplexer keys do not leak (last wins)" {
+    const allocator = testing.allocator;
+    var cfg = try parseAppConfig(allocator, "roots = [\"/a\"]\nmultiplexer = \"rex\"\nmultiplexer = \"tmux\"\n");
+    defer freeAppConfig(allocator, &cfg);
+    try testing.expectEqualStrings("tmux", cfg.multiplexer.?);
+}
+
+test "parseAppConfig: empty multiplexer value is treated as absent" {
+    const allocator = testing.allocator;
+    var cfg = try parseAppConfig(allocator, "roots = [\"/a\"]\nmultiplexer = \"\"\n");
+    defer freeAppConfig(allocator, &cfg);
+    try testing.expect(cfg.multiplexer == null);
+}
+
+test "parseTomlScalarString handles quotes, comments, and bare values" {
+    try testing.expectEqualStrings("rex", parseTomlScalarString("\"rex\""));
+    try testing.expectEqualStrings("rex", parseTomlScalarString(" \"rex\"  # use Rex"));
+    try testing.expectEqualStrings("rex", parseTomlScalarString("rex # use Rex"));
+    try testing.expectEqualStrings("tmux", parseTomlScalarString("tmux"));
+    try testing.expectEqualStrings("", parseTomlScalarString("\"\""));
+    try testing.expectEqualStrings("", parseTomlScalarString(""));
+}
+
+test "serializeAppConfig omits multiplexer when unset" {
+    const allocator = testing.allocator;
+    var cfg = AppConfig{ .roots = .empty, .default_branch_prefixes = .empty };
+    defer freeAppConfig(allocator, &cfg);
+    try cfg.roots.append(allocator, try allocator.dupe(u8, "/root"));
+
+    const out = try serializeAppConfig(allocator, cfg);
+    defer allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "multiplexer") == null);
+}
+
+test "serializeAppConfig then parseAppConfig round-trips multiplexer" {
+    // `config add-root` / `remove-root` rewrite config.toml through
+    // serializeAppConfig; the user's backend choice must survive that.
+    const allocator = testing.allocator;
+    var cfg = AppConfig{ .roots = .empty, .default_branch_prefixes = .empty };
+    defer freeAppConfig(allocator, &cfg);
+    try cfg.roots.append(allocator, try allocator.dupe(u8, "/root"));
+    cfg.multiplexer = try allocator.dupe(u8, "rex");
+
+    const out = try serializeAppConfig(allocator, cfg);
+    defer allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "multiplexer = \"rex\"\n") != null);
+
+    var parsed = try parseAppConfig(allocator, out);
+    defer freeAppConfig(allocator, &parsed);
+    try testing.expectEqualStrings("rex", parsed.multiplexer.?);
+}
+
+test "parseAppConfig with multiplexer does not leak when an allocation fails" {
+    const contents = "roots = [\"/a\"]\nmultiplexer = \"rex\"\ndefault_branch_prefixes = [\"x\"]\n";
+
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+        if (parseAppConfig(allocator, contents)) |parsed| {
+            var p = parsed;
+            freeAppConfig(allocator, &p);
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
 }
 
 test "serializeAppConfig then parseAppConfig round-trips a custom list" {
