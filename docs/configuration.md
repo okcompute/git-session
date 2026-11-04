@@ -311,6 +311,10 @@ of a throwaway server being started.
   `(my-project/feature/) - login-page`. Rex's session picker clips long labels
   at the end, so the branch prefix is left out. Labels longer than Rex's
   128-character limit are truncated.
+- **Closed tabs.** A Rex session stays open after its last tab is closed,
+  where tmux would end the session. git-session treats such an empty session
+  as gone: `fix` replaces it with a new one, and the TUI lists don't tag it
+  `[Rex]`.
 - **Attaching.** Rex has no attach step: the app always shows a session. After
   `create` or `fix`, git-session offers to show the new session in the app,
   whether or not git-session itself runs inside Rex.

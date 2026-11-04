@@ -15,6 +15,14 @@ pub const Kind = enum {
         if (std.ascii.eqlIgnoreCase(value, "rex")) return .rex;
         return null;
     }
+
+    /// Human-readable backend name used in messages ("tmux" / "Rex").
+    pub fn displayName(self: Kind) []const u8 {
+        return switch (self) {
+            .tmux => "tmux",
+            .rex => "Rex",
+        };
+    }
 };
 
 /// Picks the backend. An explicit `configured` value (the `multiplexer`
@@ -63,7 +71,8 @@ pub const Mux = union(Kind) {
                     io,
                     "Error: the `rex` command was not found on PATH or in $REX_BIN_DIR.\n" ++
                         "Rex (macOS app, public beta) only puts `rex` on PATH in its own terminals.\n" ++
-                        "Run git-session from a Rex terminal, or link the CLI shipped in the Rex app into a directory on your PATH.\n",
+                        "Run git-session from a Rex terminal, or link the CLI shipped in the Rex app into a directory on your PATH.\n" ++
+                        "To use tmux instead, set multiplexer = \"tmux\" in ~/.config/git-session/config.toml.\n",
                     .{},
                 ),
                 else => term.eprint(io, "Error: could not set up the terminal multiplexer: {any}\n", .{err}),
@@ -95,10 +104,7 @@ pub const Mux = union(Kind) {
 
     /// Human-readable backend name used in messages ("tmux" / "Rex").
     pub fn displayName(self: Mux) []const u8 {
-        return switch (self) {
-            .tmux => "tmux",
-            .rex => "Rex",
-        };
+        return Kind.displayName(self);
     }
 
     /// Generates the session name for a worktree. The caller owns it.
@@ -340,7 +346,11 @@ pub const Presence = struct {
 /// with one listing per backend. Call `deinit` to free it.
 pub const SessionIndex = struct {
     tmux_names: [][]u8 = &.{},
-    rex_labels: [][]u8 = &.{},
+    /// Owned; free with `rex.freeSessions` (done by `deinit`).
+    rex_sessions: []rex.SessionEntry = &.{},
+    /// Used to leave out Rex sessions whose tabs were all closed (Rex keeps
+    /// them, unlike tmux). `null` skips that check (unit tests).
+    rex_cli: ?rex.Rex = null,
 
     /// Lists sessions in each of `backends`. A backend that cannot be
     /// queried (not installed, server down) contributes no names.
@@ -350,38 +360,25 @@ pub const SessionIndex = struct {
             const m = maybe orelse continue;
             switch (m) {
                 .tmux => index.tmux_names = tmux.tmuxListSessionNames(allocator, io),
-                .rex => |r| index.rex_labels = rexLabels(r, allocator, io) catch &.{},
+                .rex => |r| {
+                    index.rex_sessions = r.listSessions(allocator, io) catch &.{};
+                    index.rex_cli = r;
+                },
             }
         }
         return index;
     }
 
-    /// Returns the labels of every Rex session. Caller owns the result.
-    fn rexLabels(r: rex.Rex, allocator: std.mem.Allocator, io: std.Io) ![][]u8 {
-        const sessions = try r.listSessions(allocator, io);
-        defer rex.freeSessions(allocator, sessions);
-        var labels: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (labels.items) |l| allocator.free(l);
-            labels.deinit(allocator);
-        }
-        for (sessions) |s| {
-            const label = try allocator.dupe(u8, s.label);
-            errdefer allocator.free(label);
-            try labels.append(allocator, label);
-        }
-        return labels.toOwnedSlice(allocator);
-    }
-
-    /// Frees every listed name.
+    /// Frees every listed session.
     pub fn deinit(self: SessionIndex, allocator: std.mem.Allocator) void {
         rex.freeStrings(allocator, self.tmux_names);
-        rex.freeStrings(allocator, self.rex_labels);
+        rex.freeSessions(allocator, self.rex_sessions);
     }
 
     /// Reports in which backends the session for `ref` is live. Returns an
-    /// empty presence when its names cannot be computed.
-    pub fn presence(self: SessionIndex, allocator: std.mem.Allocator, ref: SessionRef) Presence {
+    /// empty presence when its names cannot be computed. A matching Rex
+    /// session with no tabs left does not count (one `rex` call per match).
+    pub fn presence(self: SessionIndex, allocator: std.mem.Allocator, io: std.Io, ref: SessionRef) Presence {
         var p: Presence = .{};
         if (tmux.tmuxSessionName(allocator, ref.worktree, ref.branch, ref.repo_name)) |name| {
             defer allocator.free(name);
@@ -391,8 +388,9 @@ pub const SessionIndex = struct {
         } else |_| {}
         if (rex.sessionLabel(allocator, ref.worktree, ref.branch, ref.repo_name)) |label| {
             defer allocator.free(label);
-            for (self.rex_labels) |listed| {
-                if (std.mem.eql(u8, listed, label)) p.rex = true;
+            for (self.rex_sessions) |s| {
+                if (p.rex or !std.mem.eql(u8, s.label, label)) continue;
+                p.rex = if (self.rex_cli) |r| r.sessionHasBlocks(allocator, io, s.session_id) else true;
             }
         } else |_| {}
         return p;
@@ -477,21 +475,32 @@ fn ownedNames(allocator: std.mem.Allocator, items: []const []const u8) ![][]u8 {
     return out;
 }
 
+/// Builds owned Rex session entries (IDs "session:<n>") with the given
+/// labels for SessionIndex tests.
+fn ownedRexSessions(allocator: std.mem.Allocator, labels: []const []const u8) ![]rex.SessionEntry {
+    const out = try allocator.alloc(rex.SessionEntry, labels.len);
+    for (labels, 0..) |l, i| out[i] = .{
+        .session_id = try std.fmt.allocPrint(allocator, "session:{d}", .{i}),
+        .label = try allocator.dupe(u8, l),
+    };
+    return out;
+}
+
 test "SessionIndex.presence finds a worktree's session in each backend" {
     const allocator = testing.allocator;
     const index = SessionIndex{
         .tmux_names = try ownedNames(allocator, &.{ "(app/feature/) - login", "other" }),
-        .rex_labels = try ownedNames(allocator, &.{ "app · search", "app · login" }),
+        .rex_sessions = try ownedRexSessions(allocator, &.{ "app · search", "app · login" }),
     };
     defer index.deinit(allocator);
 
-    const login = index.presence(allocator, .{ .worktree = "login", .branch = "feature/login", .repo_name = "app" });
+    const login = index.presence(allocator, testing.io, .{ .worktree = "login", .branch = "feature/login", .repo_name = "app" });
     try testing.expect(login.tmux and login.rex);
 
-    const search = index.presence(allocator, .{ .worktree = "search", .branch = "feature/search", .repo_name = "app" });
+    const search = index.presence(allocator, testing.io, .{ .worktree = "search", .branch = "feature/search", .repo_name = "app" });
     try testing.expect(!search.tmux and search.rex);
 
-    const gone = index.presence(allocator, .{ .worktree = "gone", .branch = "feature/gone", .repo_name = "app" });
+    const gone = index.presence(allocator, testing.io, .{ .worktree = "gone", .branch = "feature/gone", .repo_name = "app" });
     try testing.expect(!gone.tmux and !gone.rex);
 }
 
@@ -500,7 +509,7 @@ test "SessionIndex.presence matches tmux names that tmux rewrote" {
     const allocator = testing.allocator;
     const index = SessionIndex{ .tmux_names = try ownedNames(allocator, &.{"(my_app) - x"}) };
     defer index.deinit(allocator);
-    const p = index.presence(allocator, .{ .worktree = "x", .branch = "x", .repo_name = "my.app" });
+    const p = index.presence(allocator, testing.io, .{ .worktree = "x", .branch = "x", .repo_name = "my.app" });
     try testing.expect(p.tmux and !p.rex);
 }
 
@@ -509,9 +518,9 @@ test "SessionIndex.presence matches truncated Rex labels" {
     const worktree = "w" ** 200;
     const label = try rex.sessionLabel(allocator, worktree, worktree, "app");
     defer allocator.free(label);
-    const index = SessionIndex{ .rex_labels = try ownedNames(allocator, &.{label}) };
+    const index = SessionIndex{ .rex_sessions = try ownedRexSessions(allocator, &.{label}) };
     defer index.deinit(allocator);
-    try testing.expect(index.presence(allocator, .{ .worktree = worktree, .branch = worktree, .repo_name = "app" }).rex);
+    try testing.expect(index.presence(allocator, testing.io, .{ .worktree = worktree, .branch = worktree, .repo_name = "app" }).rex);
 }
 
 test "SessionIndex: an empty index frees cleanly" {

@@ -83,7 +83,7 @@ git-session create --repository my-project --session login-page
 
 After creating a session you are offered the chance to attach to it (when running inside tmux). Outside tmux the attach command is printed to stdout.
 
-With Rex you are always asked `Show session in Rex? [Y/n]`. Answering yes asks the Rex app to show the session, which requires Remote Control to be turned on in the app's settings. If it isn't, git-session prints a hint and the session stays available in the Rex sidebar.
+With Rex you are asked `Show session in Rex? [Y/n]` whenever git-session runs in a terminal, inside Rex or not. When stdin is not a terminal (e.g. in a script), it only prints that the session is in the Rex sidebar. Answering yes asks the Rex app to show the session, which requires Remote Control to be turned on in the app's settings. If it isn't, git-session prints a hint and the session stays available in the Rex sidebar.
 
 ### `remove`
 

@@ -108,6 +108,9 @@ pub fn findBinary(allocator: std.mem.Allocator, io: std.Io, env: *const std.proc
     defer freeStrings(allocator, candidates);
 
     for (candidates) |candidate| {
+        // A directory named `rex` would also pass the execute check.
+        const stat = std.Io.Dir.cwd().statFile(io, candidate, .{}) catch continue;
+        if (stat.kind != .file) continue;
         std.Io.Dir.cwd().access(io, candidate, .{ .execute = true }) catch continue;
         return allocator.dupe(u8, candidate);
     }
@@ -152,7 +155,12 @@ const label_separator = " · ";
 pub fn sessionLabel(allocator: std.mem.Allocator, worktree: []const u8, branch: []const u8, repo_name: []const u8) ![]u8 {
     _ = branch;
     const full = try std.fmt.allocPrint(allocator, "{s}" ++ label_separator ++ "{s}", .{ repo_name, worktree });
-    const label = truncateLabel(full);
+    var label = truncateLabel(full);
+    // A cut right after the separator would leave a dangling "repo ·".
+    const bare_separator = std.mem.trim(u8, label_separator, " ");
+    if (label.len < full.len and std.mem.endsWith(u8, label, bare_separator)) {
+        label = std.mem.trimEnd(u8, label[0 .. label.len - bare_separator.len], " \t");
+    }
     if (label.len == full.len) return full;
     defer allocator.free(full);
     return allocator.dupe(u8, label);
@@ -496,8 +504,14 @@ pub const Rex = struct {
         windows: []const repo.WindowConfig,
     ) !void {
         if (self.sessionExists(allocator, io, label)) {
-            term.print(io, "Rex session '{s}' already exists.\n", .{label});
-            return;
+            // Unlike tmux, a Rex session outlives its last tab. An empty one
+            // is what `fix` is meant to repair, so replace it.
+            if (!self.labelHasNoBlocks(allocator, io, label)) {
+                term.print(io, "Rex session '{s}' already exists.\n", .{label});
+                return;
+            }
+            term.print(io, "Rex session '{s}' has no windows left; recreating it.\n", .{label});
+            try self.killSession(allocator, io, label);
         }
 
         const first_win_name = if (windows.len > 0) windows[0].name else "shell";
@@ -515,6 +529,9 @@ pub const Rex = struct {
             term.eprint(io, "Failed to create Rex session.\n", .{});
             return err;
         };
+        // The session exists from here on. If a later step fails, remove it
+        // so the caller's worktree rollback does not leave it orphaned.
+        errdefer self.killSession(allocator, io, label) catch {};
 
         const created = parseCreatedSession(allocator, r.stdout_data) catch |err| {
             term.eprint(io, "Failed to read the new Rex session's IDs.\n", .{});
@@ -627,6 +644,34 @@ pub const Rex = struct {
         const argv = buildNextSessionArgs(allocator, self.bin) catch return;
         defer allocator.free(argv);
         self.runIgnoringResult(allocator, io, argv);
+    }
+
+    /// Returns `true` unless session `session_id` is known to have no
+    /// blocks left. Any error counts as "has blocks", so a live session is
+    /// never treated as empty.
+    pub fn sessionHasBlocks(self: Rex, allocator: std.mem.Allocator, io: std.Io, session_id: []const u8) bool {
+        const argv = buildListBlocksArgs(allocator, self.bin, session_id) catch return true;
+        defer allocator.free(argv);
+        const r = self.run(allocator, io, argv) catch return true;
+        defer process.freeExecResult(allocator, r);
+        if (!r.exited_ok) return true;
+        const blocks = parseBlockIds(allocator, r.stdout_data) catch return true;
+        defer freeStrings(allocator, blocks);
+        return blocks.len > 0;
+    }
+
+    /// Returns `true` only when every session labelled `label` is known to
+    /// have no blocks left (all its tabs were closed). `false` on any error.
+    fn labelHasNoBlocks(self: Rex, allocator: std.mem.Allocator, io: std.Io, label: []const u8) bool {
+        const sessions = self.listSessions(allocator, io) catch return false;
+        defer freeSessions(allocator, sessions);
+        const ids = idsWithLabel(allocator, sessions, label) catch return false;
+        defer allocator.free(ids);
+        if (ids.len == 0) return false;
+        for (ids) |id| {
+            if (self.sessionHasBlocks(allocator, io, id)) return false;
+        }
+        return true;
     }
 
     /// Lists the full block IDs of every session labelled `label`.
@@ -984,6 +1029,14 @@ test "sessionLabel truncates very long names to 128 characters" {
     // 128 characters; "·" is two bytes, so the byte length is one more.
     try testing.expectEqual(@as(usize, max_label_len), try std.unicode.utf8CountCodepoints(label));
     try testing.expect(std.mem.startsWith(u8, label, "app · www"));
+}
+
+test "sessionLabel drops a separator left dangling by truncation" {
+    // A 126-character repository name puts the cut right after " ·".
+    const repo_name = "r" ** 126;
+    const label = try sessionLabel(testing.allocator, "login-page", "feature/login-page", repo_name);
+    defer testing.allocator.free(label);
+    try testing.expectEqualStrings(repo_name, label);
 }
 
 test "candidatePaths lists PATH entries then REX_BIN_DIR" {

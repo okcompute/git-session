@@ -336,7 +336,7 @@ pub const TuiApp = struct {
             const branch = self.worktreeBranch(sr.root, bare_repo_path, wt);
             defer if (branch) |b| self.allocator.free(b);
             const p: mux.Presence = if (branch) |b|
-                index.presence(self.allocator, .{ .worktree = wt, .branch = b, .repo_name = sr.name })
+                index.presence(self.allocator, self.io, .{ .worktree = wt, .branch = b, .repo_name = sr.name })
             else
                 .{};
             self.worktree_presence.append(self.allocator, p) catch return;

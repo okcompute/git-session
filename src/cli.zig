@@ -325,13 +325,15 @@ fn removeRootAndOptionallyContents(
     var entries = repo.listAllRepositories(allocator, io, env, &single_root, true) catch std.ArrayList(repo.RepoEntry).empty;
     defer repo.freeRepoEntries(allocator, &entries);
 
-    // `config` runs before main selects the multiplexer, so pick it here,
-    // only when there are repositories whose sessions may need tearing down.
+    // `config` runs before main selects the multiplexer. The backend itself
+    // is only set up once the user confirms deleting repositories, so that
+    // an unusable backend never blocks merely unhooking the root.
+    const kind_name = if (mux.chooseKind(cfg.multiplexer, env.get("REX_SESSION"), env.get("TMUX"))) |k|
+        k.displayName()
+    else |_|
+        "terminal";
     var multiplexer: ?mux.Mux = null;
     defer if (multiplexer) |m| m.deinit(allocator);
-    if (entries.items.len > 0) {
-        multiplexer = mux.Mux.initOrExit(allocator, io, env, cfg.multiplexer);
-    }
 
     var should_delete_repos = false;
     if (entries.items.len > 0) {
@@ -342,7 +344,7 @@ fn removeRootAndOptionallyContents(
             for (entries.items, 1..) |e, n| {
                 term.print(io, "  {d}. {s}\n", .{ n, e.name });
             }
-            term.print(io, "\nAlso remove these repositories and their {s} sessions? [y/N] ", .{multiplexer.?.displayName()});
+            term.print(io, "\nAlso remove these repositories and their {s} sessions? [y/N] ", .{kind_name});
             var buf: [8]u8 = undefined;
             const input = term.readLine(io, &buf) catch "";
             should_delete_repos = input.len > 0 and (input[0] == 'y' or input[0] == 'Y');
@@ -353,6 +355,7 @@ fn removeRootAndOptionallyContents(
     }
 
     if (should_delete_repos) {
+        multiplexer = mux.Mux.initOrExit(allocator, io, env, cfg.multiplexer);
         multiplexer.?.ensureReadyOrExit(allocator, io);
         for (entries.items) |entry| {
             const repo_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.root, entry.name }) catch {
@@ -1292,6 +1295,13 @@ fn offerAttach(allocator: std.mem.Allocator, io: std.Io, env: *const std.process
             }
         },
         .rex => {
+            // Without a terminal (scripts, closed stdin) the empty answer
+            // would mean "yes" and switch the Rex app; don't ask.
+            const interactive = term.stdin_file.isTty(io) catch false;
+            if (!interactive) {
+                term.print(io, "Session '{s}' is in the Rex sidebar.\n", .{tmux_name});
+                return;
+            }
             term.print(io, "Show session in Rex? [Y/n] ", .{});
             var buf: [8]u8 = undefined;
             const input = term.readLine(io, &buf) catch "";
