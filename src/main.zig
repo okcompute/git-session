@@ -4,6 +4,7 @@ const term = @import("term.zig");
 const config = @import("config.zig");
 const cli = @import("cli.zig");
 const tui = @import("tui.zig");
+const mux = @import("mux.zig");
 
 pub const version = build_options.version;
 
@@ -130,6 +131,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // ── Terminal multiplexer (tmux or Rex) ──────────────────────────────────
+    //
+    // Everything below creates, attaches to, or tears down sessions. Exits
+    // with a clear message when the configured backend is unusable (status
+    // 4 when the Rex server is not running).
+
+    const multiplexer = mux.Mux.initOrExit(app_alloc, io, env, app_config.multiplexer);
+    defer multiplexer.deinit(app_alloc);
+    multiplexer.ensureReadyOrExit(app_alloc, io);
+
     // ── remove-repo (whole-repository removal) ──────────────────────────────
 
     if (args.len >= 2 and std.mem.eql(u8, args[1], "remove-repo")) {
@@ -161,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
 
-        try cli.handleRemoveRepoCommand(app_alloc, io, env, app_config, name, assume_yes);
+        try cli.handleRemoveRepoCommand(app_alloc, io, env, app_config, multiplexer, name, assume_yes);
         return;
     }
 
@@ -222,13 +233,13 @@ pub fn main(init: std.process.Init) !void {
             // when the operation finished non-interactively, or a populated
             // `CliArgs` when the TUI should take over.
             const maybe_tui_args: ?cli.CliArgs = switch (parsed.operation.?) {
-                .create => try cli.handleCreateCommand(app_alloc, io, env, app_config, parsed),
-                .remove => try cli.handleRemoveCommand(app_alloc, io, env, app_config, parsed),
-                .fix => try cli.handleFixCommand(app_alloc, io, env, app_config, parsed),
+                .create => try cli.handleCreateCommand(app_alloc, io, env, app_config, multiplexer, parsed),
+                .remove => try cli.handleRemoveCommand(app_alloc, io, env, app_config, multiplexer, parsed),
+                .fix => try cli.handleFixCommand(app_alloc, io, env, app_config, multiplexer, parsed),
             };
 
             if (maybe_tui_args) |tui_args| {
-                try tui.runTui(allocator, io, env, app_config, tui_args);
+                try tui.runTui(allocator, io, env, app_config, multiplexer, tui_args);
             }
             return;
         }
@@ -256,7 +267,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try tui.runTui(allocator, io, env, app_config, tui_args);
+    try tui.runTui(allocator, io, env, app_config, multiplexer, tui_args);
 }
 
 /// Maps a command string to a `CliOperation`. Only called for strings that

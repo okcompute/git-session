@@ -52,6 +52,8 @@ pub fn build(b: *std.Build) void {
         "src/git.zig",
         "src/git_branch_validate.zig",
         "src/tmux.zig",
+        "src/rex.zig",
+        "src/mux.zig",
         "src/term.zig",
         "src/repo.zig",
         "src/process.zig",

@@ -64,7 +64,7 @@ To always fetch the newest release, replace `releases/download/${VERSION}` with 
 ## Requirements
 
 - Git (>= 2.42 to create sessions in empty repositories)
-- tmux >= 3.0
+- tmux >= 3.0, or, to use [Rex](configuration.md#using-rex) instead: the Rex app (macOS, public beta) running, with the `rex` CLI on `PATH`
 
 Zig 0.16+ is required only when building from source.
 

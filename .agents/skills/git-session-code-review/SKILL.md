@@ -164,6 +164,24 @@ scaffolding before finishing — and never leave throwaway harness files
 under `src/` (they get picked up by the build and can leak into a
 commit).
 
+For runs that create or remove sessions, isolate the multiplexers first
+(see "Manual end-to-end runs" below).
+
+## Manual end-to-end runs
+
+Runs that create or remove sessions (with a throwaway `HOME`) must not touch
+the user's real ones:
+
+- **tmux:** in the shell you launch from, `unset TMUX` and export
+  `TMUX_TMPDIR=<temp dir>`; an inherited `TMUX` targets the user's real
+  server. Leave `TMUX` alone inside a harness pane, where it points at the
+  isolated server.
+- **Rex:** a throwaway `HOME` moves rex's socket path (rex then reports no
+  server), so point `REX_RUNTIME_DIR` at the real runtime directory
+  (`~/Library/Application Support/rex` on macOS).
+- **Names:** use a unique repository and session name (e.g. `gstest-<pid>`);
+  `remove` kills sessions by name in both tmux and Rex.
+
 ## Test coverage
 
 This codebase uses Zig's built-in `test` blocks, co-located at the
