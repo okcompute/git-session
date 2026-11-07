@@ -113,15 +113,46 @@ command = "git status"
     npm run dev
     """
     ```
+- `fix_command` — (optional) command(s) to run instead of `command` when the session is restored with `fix`. Same forms as `command`. If the key is absent, `fix` runs `command`. Set `fix_command = ""` to open a plain shell on `fix`.
 
 Windows are created in order. The first window receives focus after creation.
 
 **If no `[[window]]` sections are defined**, a single shell window is created with no command.
 
+### Different commands on `fix`
+
+`fix` rebuilds a session for a worktree that already exists, for example after
+a reboot. Some commands only make sense the first time a session is created. A
+first build can be skipped, and an AI agent can resume its earlier conversation
+instead of starting a new one:
+
+```toml
+[[window]]
+name = "build"
+command = "zig build"
+fix_command = ""        # plain shell on fix
+
+[[window]]
+name = "ai"
+command = "opencode --session \"ses_$GS_SESSION_SLUG\""
+# no fix_command: fix runs the same command, which resumes the session
+```
+
+`opencode --session <id>` continues the session with that ID, or creates it if
+it does not exist. With an ID built from `GS_SESSION_SLUG` (see below), `create`
+starts a new OpenCode session and `fix` reopens the same one. OpenCode
+session IDs must start with `ses`.
+
 ### Environment variables
 
-Every window command runs with the `GS_REPO_PATH` environment variable set to
-the session's worktree folder.
+Every window command runs with these environment variables set:
+
+- `GS_REPO_PATH`: the session's worktree folder.
+- `GS_SESSION_SLUG`: a stable slug made of the repository and session names,
+  lowercase, with every run of characters other than letters and digits
+  replaced by `-`. For example, `my-project/login-page` becomes
+  `my-project-login-page`. It stays the same across `create` and `fix`, so
+  commands can use it to name things tied to the session.
 
 Commands already start with their working directory set to the worktree, so you
 do not need `GS_REPO_PATH` to reference files in the repository directly (just
@@ -135,10 +166,10 @@ name = "build"
 command = "pushd ~/tools && ./run-build.sh --target \"$GS_REPO_PATH\""
 ```
 
-With tmux, `GS_REPO_PATH` is also available in any interactive shell in the
+With tmux, both variables are also available in any interactive shell in the
 session and in windows or panes you open later. Requires tmux >= 3.0.
 
-With Rex, `GS_REPO_PATH` is set in the shell of every window git-session
+With Rex, both variables are set in the shell of every window git-session
 creates, but not in tabs or splits you open yourself later (see
 [Using Rex](#using-rex)).
 
@@ -298,11 +329,12 @@ of a throwaway server being started.
 
 **Differences from tmux**
 
-- **`GS_REPO_PATH`.** Rex has no option to set an environment variable for a
-  new terminal (no equivalent of tmux `-e`). git-session starts each window's
-  shell as `/usr/bin/env GS_REPO_PATH=<worktree> $SHELL -l`, so the variable is
-  set for that shell and everything it runs. Tabs or splits you open later in
-  the session start a normal shell without it.
+- **`GS_REPO_PATH` and `GS_SESSION_SLUG`.** Rex has no option to set an
+  environment variable for a new terminal (no equivalent of tmux `-e`).
+  git-session starts each window's shell as
+  `/usr/bin/env GS_REPO_PATH=<worktree> GS_SESSION_SLUG=<slug> $SHELL -l`, so
+  the variables are set for that shell and everything it runs. Tabs or splits
+  you open later in the session start a normal shell without them.
 - **Commands are typed into the shell**, as with tmux. They run with your
   interactive shell configuration (aliases and functions work), pipes and `&&`
   work, and the shell stays open after the command exits.

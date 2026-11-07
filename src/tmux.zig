@@ -58,10 +58,15 @@ pub fn tmuxSessionExists(allocator: std.mem.Allocator, io: std.Io, session_name:
 /// holding the worktree path so window commands can reference it.
 const gs_repo_path_var = "GS_REPO_PATH";
 
+/// The environment-variable name exported to every session window,
+/// holding `repo.sessionSlug` of the worktree.
+const gs_session_slug_var = "GS_SESSION_SLUG";
+
 /// Builds the argv for `tmux new-session` that creates a detached session
 /// whose first window is `window_name`, with its working directory set to
-/// `worktree_path` and the `GS_REPO_PATH` environment variable set to
-/// `repo_path_env` (which must be of the form "GS_REPO_PATH=<path>").
+/// `worktree_path` and the `GS_REPO_PATH` / `GS_SESSION_SLUG` environment
+/// variables set from `repo_path_env` / `slug_env` (of the form
+/// "GS_REPO_PATH=<path>" / "GS_SESSION_SLUG=<slug>").
 ///
 /// The returned slice is owned by the caller and must be freed with
 /// `allocator.free`; the string elements are borrowed from the arguments
@@ -72,14 +77,16 @@ fn buildNewSessionArgs(
     window_name: []const u8,
     worktree_path: []const u8,
     repo_path_env: []const u8,
+    slug_env: []const u8,
 ) ![]const []const u8 {
-    return try allocator.dupe([]const u8, &.{ "tmux", "new-session", "-s", session_name, "-n", window_name, "-d", "-c", worktree_path, "-e", repo_path_env });
+    return try allocator.dupe([]const u8, &.{ "tmux", "new-session", "-s", session_name, "-n", window_name, "-d", "-c", worktree_path, "-e", repo_path_env, "-e", slug_env });
 }
 
 /// Builds the argv for `tmux new-window` that adds a window named
 /// `window_name` to `session_name`, with its working directory set to
-/// `worktree_path` and the `GS_REPO_PATH` environment variable set to
-/// `repo_path_env` (which must be of the form "GS_REPO_PATH=<path>").
+/// `worktree_path` and the `GS_REPO_PATH` / `GS_SESSION_SLUG` environment
+/// variables set from `repo_path_env` / `slug_env` (of the form
+/// "GS_REPO_PATH=<path>" / "GS_SESSION_SLUG=<slug>").
 ///
 /// The returned slice is owned by the caller and must be freed with
 /// `allocator.free`; the string elements are borrowed from the arguments
@@ -90,25 +97,28 @@ fn buildNewWindowArgs(
     window_name: []const u8,
     worktree_path: []const u8,
     repo_path_env: []const u8,
+    slug_env: []const u8,
 ) ![]const []const u8 {
-    return try allocator.dupe([]const u8, &.{ "tmux", "new-window", "-n", window_name, "-t", session_name, "-c", worktree_path, "-e", repo_path_env });
+    return try allocator.dupe([]const u8, &.{ "tmux", "new-window", "-n", window_name, "-t", session_name, "-c", worktree_path, "-e", repo_path_env, "-e", slug_env });
 }
 
 /// Creates a new detached tmux session named `session_name` with its
 /// working directory set to `worktree_path`. One window is created per
 /// entry in `windows` (falling back to a single "shell" window when the
-/// slice is empty), and the configured `command` is sent to each window
-/// via `send-keys`. If a session with the same name already exists, the
+/// slice is empty), and each window's commands for `mode` (`command`, or
+/// `fix_command` when restoring) are sent to it via `send-keys`. If a
+/// session with the same name already exists, the
 /// function prints a message and returns without error. Returns
 /// `error.TmuxSessionCreationFailed` when the `tmux new-session` command
 /// fails.
 ///
 /// The worktree path is exported to every window as the `GS_REPO_PATH`
 /// environment variable, so configured commands can reference the
-/// session's repository folder (e.g. `$GS_REPO_PATH`). This relies on
+/// session's repository folder (e.g. `$GS_REPO_PATH`). `GS_SESSION_SLUG`
+/// is exported the same way. This relies on
 /// tmux's `-e` flag for `new-session`/`new-window`, which requires
 /// tmux >= 3.0; on older tmux the session creation command will fail.
-pub fn tmuxCreateSession(allocator: std.mem.Allocator, io: std.Io, session_name: []const u8, worktree_path: []const u8, windows: []const repo.WindowConfig) !void {
+pub fn tmuxCreateSession(allocator: std.mem.Allocator, io: std.Io, session_name: []const u8, worktree_path: []const u8, windows: []const repo.WindowConfig, mode: repo.SessionMode) !void {
     if (tmuxSessionExists(allocator, io, session_name)) {
         term.print(io, "TMUX session '{s}' already exists.\n", .{session_name});
         return;
@@ -125,9 +135,13 @@ pub fn tmuxCreateSession(allocator: std.mem.Allocator, io: std.Io, session_name:
     // string, avoiding injection.
     const repo_path_env = try std.fmt.allocPrint(allocator, "{s}={s}", .{ gs_repo_path_var, worktree_path });
     defer allocator.free(repo_path_env);
+    const slug = try repo.sessionSlug(allocator, worktree_path);
+    defer allocator.free(slug);
+    const slug_env = try std.fmt.allocPrint(allocator, "{s}={s}", .{ gs_session_slug_var, slug });
+    defer allocator.free(slug_env);
 
     // Create the session with the first window
-    const new_session_args = try buildNewSessionArgs(allocator, session_name, effective_name, worktree_path, repo_path_env);
+    const new_session_args = try buildNewSessionArgs(allocator, session_name, effective_name, worktree_path, repo_path_env, slug_env);
     defer allocator.free(new_session_args);
     var r = try process.exec(allocator, io, new_session_args, null);
     process.freeExecResult(allocator, r);
@@ -140,10 +154,12 @@ pub fn tmuxCreateSession(allocator: std.mem.Allocator, io: std.Io, session_name:
     // (e.g. by the user) inherit it too.
     r = try process.exec(allocator, io, &.{ "tmux", "set-environment", "-t", session_name, gs_repo_path_var, worktree_path }, null);
     process.freeExecResult(allocator, r);
+    r = try process.exec(allocator, io, &.{ "tmux", "set-environment", "-t", session_name, gs_session_slug_var, slug }, null);
+    process.freeExecResult(allocator, r);
 
     // Run commands in first window if configured
     if (windows.len > 0) {
-        for (windows[0].commands.items) |cmd| {
+        for (windows[0].commandsFor(mode)) |cmd| {
             r = try process.exec(allocator, io, &.{ "tmux", "send-keys", "-t", session_name, cmd, "Enter" }, null);
             process.freeExecResult(allocator, r);
         }
@@ -153,12 +169,12 @@ pub fn tmuxCreateSession(allocator: std.mem.Allocator, io: std.Io, session_name:
     if (windows.len > 1) {
         for (windows[1..]) |win| {
             const win_name = if (win.name.len > 0) win.name else "shell";
-            const new_window_args = try buildNewWindowArgs(allocator, session_name, win_name, worktree_path, repo_path_env);
+            const new_window_args = try buildNewWindowArgs(allocator, session_name, win_name, worktree_path, repo_path_env, slug_env);
             defer allocator.free(new_window_args);
             r = try process.exec(allocator, io, new_window_args, null);
             process.freeExecResult(allocator, r);
 
-            for (win.commands.items) |cmd| {
+            for (win.commandsFor(mode)) |cmd| {
                 r = try process.exec(allocator, io, &.{ "tmux", "send-keys", "-t", session_name, cmd, "Enter" }, null);
                 process.freeExecResult(allocator, r);
             }
@@ -550,11 +566,11 @@ test "buildNewSessionArgs sets GS_REPO_PATH to the worktree path" {
     const repo_path_env = try std.fmt.allocPrint(allocator, "GS_REPO_PATH={s}", .{worktree_path});
     defer allocator.free(repo_path_env);
 
-    const args = try buildNewSessionArgs(allocator, "sess", "editor", worktree_path, repo_path_env);
+    const args = try buildNewSessionArgs(allocator, "sess", "editor", worktree_path, repo_path_env, "GS_SESSION_SLUG=repo-my-session");
     defer allocator.free(args);
 
     try testing.expectEqualDeep(
-        @as([]const []const u8, &.{ "tmux", "new-session", "-s", "sess", "-n", "editor", "-d", "-c", worktree_path, "-e", "GS_REPO_PATH=/home/user/repo/my-session" }),
+        @as([]const []const u8, &.{ "tmux", "new-session", "-s", "sess", "-n", "editor", "-d", "-c", worktree_path, "-e", "GS_REPO_PATH=/home/user/repo/my-session", "-e", "GS_SESSION_SLUG=repo-my-session" }),
         args,
     );
     try expectRepoPathEnvArg(args, worktree_path);
@@ -566,11 +582,11 @@ test "buildNewWindowArgs sets GS_REPO_PATH to the worktree path" {
     const repo_path_env = try std.fmt.allocPrint(allocator, "GS_REPO_PATH={s}", .{worktree_path});
     defer allocator.free(repo_path_env);
 
-    const args = try buildNewWindowArgs(allocator, "sess", "logs", worktree_path, repo_path_env);
+    const args = try buildNewWindowArgs(allocator, "sess", "logs", worktree_path, repo_path_env, "GS_SESSION_SLUG=repo-my-session");
     defer allocator.free(args);
 
     try testing.expectEqualDeep(
-        @as([]const []const u8, &.{ "tmux", "new-window", "-n", "logs", "-t", "sess", "-c", worktree_path, "-e", "GS_REPO_PATH=/home/user/repo/my-session" }),
+        @as([]const []const u8, &.{ "tmux", "new-window", "-n", "logs", "-t", "sess", "-c", worktree_path, "-e", "GS_REPO_PATH=/home/user/repo/my-session", "-e", "GS_SESSION_SLUG=repo-my-session" }),
         args,
     );
     try expectRepoPathEnvArg(args, worktree_path);
@@ -584,7 +600,7 @@ test "buildNewSessionArgs passes worktree path with special characters verbatim"
     const repo_path_env = try std.fmt.allocPrint(allocator, "GS_REPO_PATH={s}", .{worktree_path});
     defer allocator.free(repo_path_env);
 
-    const args = try buildNewSessionArgs(allocator, "s", "w", worktree_path, repo_path_env);
+    const args = try buildNewSessionArgs(allocator, "s", "w", worktree_path, repo_path_env, "GS_SESSION_SLUG=tmp-weird-path-echo-hi");
     defer allocator.free(args);
 
     try expectRepoPathEnvArg(args, worktree_path);

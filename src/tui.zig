@@ -1334,7 +1334,7 @@ pub const TuiApp = struct {
             return;
         };
         defer self.allocator.free(tmux_name);
-        self.multiplexer.createSession(self.allocator, self.io, self.env, tmux_name, wt_path, self.worker_windows) catch |err| {
+        self.multiplexer.createSession(self.allocator, self.io, self.env, tmux_name, wt_path, self.worker_windows, .create) catch |err| {
             // Roll back: remove the worktree and session file so the
             // user doesn't end up with an orphaned, half-created session.
             _ = git.gitRemoveWorktree(self.allocator, self.io, bare_repo_path, name) catch {};
@@ -1554,7 +1554,7 @@ pub const TuiApp = struct {
         const tmux_name = try self.multiplexer.sessionName(self.allocator, session_name, branch_for_name, sr.name);
         defer self.allocator.free(tmux_name);
 
-        self.multiplexer.createSession(self.allocator, self.io, self.env, tmux_name, wt_path, sr.config.windows.items) catch |err| {
+        self.multiplexer.createSession(self.allocator, self.io, self.env, tmux_name, wt_path, sr.config.windows.items, .fix) catch |err| {
             if (err == error.RexServerNotRunning) {
                 self.setMessage("Failed to fix session: the Rex server is not running. Open the Rex app and try again.", true);
                 self.screen = .message;

@@ -9,11 +9,54 @@ const git = @import("git.zig");
 
 pub const repo_config_filename = ".git-session.toml";
 
+/// Why a multiplexer session is being built: for a newly created session,
+/// or to restore an existing worktree's session (`fix`).
+pub const SessionMode = enum { create, fix };
+
 /// Describes a single tmux window to create when starting a session.
 pub const WindowConfig = struct {
     name: []const u8,
     commands: std.ArrayList([]const u8), // empty = just open a shell
+    /// Commands run instead of `commands` when restoring a session with
+    /// `fix`. `null` (no `fix_command` key) falls back to `commands`; an
+    /// empty list (`fix_command = ""`) just opens a shell.
+    fix_commands: ?std.ArrayList([]const u8) = null,
+
+    /// Returns the commands to type into this window for `mode`.
+    pub fn commandsFor(self: WindowConfig, mode: SessionMode) []const []const u8 {
+        return switch (mode) {
+            .create => self.commands.items,
+            .fix => if (self.fix_commands) |fc| fc.items else self.commands.items,
+        };
+    }
 };
+
+/// Builds a stable, shell- and ID-friendly slug identifying the session
+/// at `worktree_path` (`<root>/<repo>/<worktree>`), e.g. `my-app-fix-login`.
+/// Exported to session windows as `GS_SESSION_SLUG` so commands can name
+/// resources after the session (e.g. `opencode --session "ses_$GS_SESSION_SLUG"`).
+/// Lowercase ASCII letters and digits are kept; every other run of
+/// characters becomes a single `-`. The caller owns the returned slice.
+pub fn sessionSlug(allocator: std.mem.Allocator, worktree_path: []const u8) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, worktree_path, "/");
+    const worktree = std.fs.path.basename(trimmed);
+    const repo_name = std.fs.path.basename(std.fs.path.dirname(trimmed) orelse "");
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for ([_][]const u8{ repo_name, worktree }) |part| {
+        for (part) |c| {
+            if (std.ascii.isAlphanumeric(c)) {
+                try out.append(allocator, std.ascii.toLower(c));
+            } else if (out.items.len > 0 and out.items[out.items.len - 1] != '-') {
+                try out.append(allocator, '-');
+            }
+        }
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '-') try out.append(allocator, '-');
+    }
+    if (out.items.len > 0 and out.items[out.items.len - 1] == '-') _ = out.pop();
+    return out.toOwnedSlice(allocator);
+}
 
 /// Per-repository configuration loaded from `.git-session.toml`.
 ///
@@ -55,24 +98,26 @@ fn parseRepoConfigFile(allocator: std.mem.Allocator, io: std.Io, filepath: []con
     var in_window = false;
     var cur_win_name: []const u8 = "";
     var cur_win_cmds: std.ArrayList([]const u8) = .empty;
+    var cur_win_fix_cmds: ?std.ArrayList([]const u8) = null;
 
-    // Track whether we're inside a triple-quoted multi-line string for `command`
-    var in_multiline_cmd = false;
+    // The command list a triple-quoted multi-line string (`command` or
+    // `fix_command`) is being collected into, or null outside of one.
+    var multiline_target: ?*std.ArrayList([]const u8) = null;
 
     var lines = std.mem.splitScalar(u8, contents, '\n');
     while (lines.next()) |raw_line| {
         // When collecting multi-line command lines, preserve content but trim \r
-        if (in_multiline_cmd) {
+        if (multiline_target) |target| {
             const ml_line = std.mem.trimEnd(u8, raw_line, "\r");
             // Check for closing triple quotes (must be on its own line)
             const trimmed = std.mem.trim(u8, ml_line, " \t");
             if (std.mem.eql(u8, trimmed, "\"\"\"")) {
-                in_multiline_cmd = false;
+                multiline_target = null;
                 continue;
             }
             // Add non-empty lines as individual commands
             if (trimmed.len > 0) {
-                try cur_win_cmds.append(allocator, try allocator.dupe(u8, trimmed));
+                try target.append(allocator, try allocator.dupe(u8, trimmed));
             }
             continue;
         }
@@ -87,11 +132,13 @@ fn parseRepoConfigFile(allocator: std.mem.Allocator, io: std.Io, filepath: []con
                 try cfg.windows.append(allocator, .{
                     .name = cur_win_name,
                     .commands = cur_win_cmds,
+                    .fix_commands = cur_win_fix_cmds,
                 });
             }
             in_window = true;
             cur_win_name = "";
             cur_win_cmds = .empty;
+            cur_win_fix_cmds = null;
             continue;
         }
 
@@ -104,30 +151,13 @@ fn parseRepoConfigFile(allocator: std.mem.Allocator, io: std.Io, filepath: []con
                 if (std.mem.eql(u8, key, "name")) {
                     cur_win_name = try allocator.dupe(u8, config.stripQuotes(value_raw));
                 } else if (std.mem.eql(u8, key, "command")) {
-                    // Check for triple-quoted multi-line string
-                    if (std.mem.startsWith(u8, value_raw, "\"\"\"")) {
-                        const after_quotes = std.mem.trim(u8, value_raw[3..], " \t");
-                        if (after_quotes.len > 0 and std.mem.endsWith(u8, after_quotes, "\"\"\"")) {
-                            // Single-line triple-quoted: command = """something"""
-                            const inner = after_quotes[0 .. after_quotes.len - 3];
-                            const trimmed_inner = std.mem.trim(u8, inner, " \t");
-                            if (trimmed_inner.len > 0) {
-                                try cur_win_cmds.append(allocator, try allocator.dupe(u8, trimmed_inner));
-                            }
-                        } else {
-                            // Start of multi-line: command = """
-                            in_multiline_cmd = true;
-                            // If there's content after """ on the same line, capture it
-                            if (after_quotes.len > 0) {
-                                try cur_win_cmds.append(allocator, try allocator.dupe(u8, after_quotes));
-                            }
-                        }
-                    } else {
-                        // Single command: command = "vim"
-                        const cmd = config.stripQuotes(value_raw);
-                        if (cmd.len > 0) {
-                            try cur_win_cmds.append(allocator, try allocator.dupe(u8, cmd));
-                        }
+                    if (try appendCommandValue(allocator, &cur_win_cmds, value_raw)) {
+                        multiline_target = &cur_win_cmds;
+                    }
+                } else if (std.mem.eql(u8, key, "fix_command")) {
+                    if (cur_win_fix_cmds == null) cur_win_fix_cmds = .empty;
+                    if (try appendCommandValue(allocator, &cur_win_fix_cmds.?, value_raw)) {
+                        multiline_target = &cur_win_fix_cmds.?;
                     }
                 }
             } else {
@@ -152,10 +182,44 @@ fn parseRepoConfigFile(allocator: std.mem.Allocator, io: std.Io, filepath: []con
         try cfg.windows.append(allocator, .{
             .name = cur_win_name,
             .commands = cur_win_cmds,
+            .fix_commands = cur_win_fix_cmds,
         });
     }
 
     return cfg;
+}
+
+/// Parses the value of a window `command` / `fix_command` key and appends
+/// its commands to `cmds`. Supports `"vim"`, `"""vim"""`, and the opening
+/// line of a multi-line `"""` block. Returns `true` when a multi-line block
+/// was opened and the following lines (until a closing `"""` line) belong
+/// to `cmds`.
+fn appendCommandValue(allocator: std.mem.Allocator, cmds: *std.ArrayList([]const u8), value_raw: []const u8) !bool {
+    // Check for triple-quoted multi-line string
+    if (std.mem.startsWith(u8, value_raw, "\"\"\"")) {
+        const after_quotes = std.mem.trim(u8, value_raw[3..], " \t");
+        if (after_quotes.len > 0 and std.mem.endsWith(u8, after_quotes, "\"\"\"")) {
+            // Single-line triple-quoted: command = """something"""
+            const inner = after_quotes[0 .. after_quotes.len - 3];
+            const trimmed_inner = std.mem.trim(u8, inner, " \t");
+            if (trimmed_inner.len > 0) {
+                try cmds.append(allocator, try allocator.dupe(u8, trimmed_inner));
+            }
+            return false;
+        }
+        // Start of multi-line: command = """
+        // If there's content after """ on the same line, capture it
+        if (after_quotes.len > 0) {
+            try cmds.append(allocator, try allocator.dupe(u8, after_quotes));
+        }
+        return true;
+    }
+    // Single command: command = "vim"
+    const cmd = config.stripQuotes(value_raw);
+    if (cmd.len > 0) {
+        try cmds.append(allocator, try allocator.dupe(u8, cmd));
+    }
+    return false;
 }
 
 /// Loads only the centralized per-repo config for `repo_name` from
@@ -221,6 +285,10 @@ pub fn freeRepoConfig(allocator: std.mem.Allocator, cfg: *RepoConfig) void {
         if (w.name.len > 0) allocator.free(w.name);
         for (w.commands.items) |cmd| allocator.free(cmd);
         w.commands.deinit(allocator);
+        if (w.fix_commands) |*fc| {
+            for (fc.items) |cmd| allocator.free(cmd);
+            fc.deinit(allocator);
+        }
     }
     cfg.windows.deinit(allocator);
     if (cfg.origin_url.len > 0) allocator.free(cfg.origin_url);
@@ -994,6 +1062,76 @@ test "loadRepoConfig parses multi-line command block" {
     try testing.expectEqual(@as(usize, 2), cfg.windows.items[0].commands.items.len);
     try testing.expectEqualStrings("npm install", cfg.windows.items[0].commands.items[0]);
     try testing.expectEqualStrings("npm run dev", cfg.windows.items[0].commands.items[1]);
+}
+
+test "loadRepoConfig parses fix_command and commandsFor picks per mode" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const toml =
+        \\bare_repo = "app"
+        \\start_branches = ["main"]
+        \\branch_prefixes = []
+        \\
+        \\[[window]]
+        \\name = "build"
+        \\command = "zig build"
+        \\fix_command = ""
+        \\
+        \\[[window]]
+        \\name = "ai"
+        \\fix_command = """
+        \\git status
+        \\opencode --continue
+        \\"""
+        \\command = "opencode"
+        \\
+        \\[[window]]
+        \\name = "editor"
+        \\command = "vim"
+    ;
+    writeTmpFile(&tmp, repo_config_filename, toml);
+
+    const allocator = testing.allocator;
+    var test_env = try std.process.Environ.createMap(testing.environ, allocator);
+    defer test_env.deinit();
+    const path = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(path);
+
+    var cfg = try loadRepoConfig(allocator, testing.io, &test_env, path);
+    defer freeRepoConfig(allocator, &cfg);
+
+    try testing.expectEqual(@as(usize, 3), cfg.windows.items.len);
+    const build = cfg.windows.items[0];
+    const ai = cfg.windows.items[1];
+    const editor = cfg.windows.items[2];
+
+    // An empty fix_command means "just a shell" on fix.
+    try testing.expectEqualDeep(@as([]const []const u8, &.{"zig build"}), build.commandsFor(.create));
+    try testing.expectEqual(@as(usize, 0), build.commandsFor(.fix).len);
+
+    // A multi-line fix_command, declared before command, stays separate.
+    try testing.expectEqualDeep(@as([]const []const u8, &.{"opencode"}), ai.commandsFor(.create));
+    try testing.expectEqualDeep(@as([]const []const u8, &.{ "git status", "opencode --continue" }), ai.commandsFor(.fix));
+
+    // Without fix_command, fix falls back to command.
+    try testing.expect(editor.fix_commands == null);
+    try testing.expectEqualDeep(@as([]const []const u8, &.{"vim"}), editor.commandsFor(.fix));
+}
+
+test "sessionSlug combines repo and worktree names into a lowercase slug" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { path: []const u8, expected: []const u8 }{
+        .{ .path = "/root/my-app/fix-login", .expected = "my-app-fix-login" },
+        .{ .path = "/root/My_App/Fix.Login/", .expected = "my-app-fix-login" },
+        .{ .path = "/tmp/weird path;$(echo hi)", .expected = "tmp-weird-path-echo-hi" },
+        .{ .path = "/root/--repo--/__wt__", .expected = "repo-wt" },
+    };
+    for (cases) |c| {
+        const slug = try sessionSlug(allocator, c.path);
+        defer allocator.free(slug);
+        try testing.expectEqualStrings(c.expected, slug);
+    }
 }
 
 test "loadRepoConfig parses origin_url and root recovery fields" {

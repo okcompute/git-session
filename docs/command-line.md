@@ -112,7 +112,7 @@ git-session remove --repository my-project
 
 ### `fix`
 
-Recreate the tmux (or Rex) session for an existing worktree (useful after a reboot or when the tmux server was restarted). When the session still exists it is left as is and you are offered to attach to it (or show it in Rex).
+Recreate the tmux (or Rex) session for an existing worktree (useful after a reboot or when the tmux server was restarted). When the session still exists it is left as is and you are offered to attach to it (or show it in Rex). Windows run their `fix_command` instead of `command` when one is configured (see [Different commands on `fix`](configuration.md#different-commands-on-fix)).
 
 ```
 git-session fix --repository <name> [--session <name>]
