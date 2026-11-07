@@ -35,7 +35,7 @@ pub const WindowConfig = struct {
 /// at `worktree_path` (`<root>/<repo>/<worktree>`), as `<repo>.<worktree>`
 /// (e.g. `my-app.fix-login`). Exported to session windows as
 /// `GS_SESSION_SLUG` so commands can name resources after the session
-/// (e.g. `opencode --session "ses_$GS_SESSION_SLUG"`).
+/// (e.g. `opencode --session ses_$GS_SESSION_SLUG`).
 ///
 /// In each part, ASCII letters, digits, `_` and `-` are kept as is; every
 /// run of other characters (including `.`) becomes a single `-`. A part

@@ -104,7 +104,7 @@ command = "git status"
 
 - `name` — the window name (shown in the tmux status bar, or as the tab label in Rex)
 - `command` — (optional) command(s) to execute in the window after `cd`-ing to the worktree. If omitted or empty, the window opens a plain shell. Supports two forms:
-  - **Single command:** `command = "vim"`
+  - **Single command:** `command = "vim"`. Escape sequences such as `\"` are not supported; use the multi-line form for a command that contains double quotes.
   - **Multiple commands:** use a triple-quoted multi-line string where each line is a separate command, executed in order:
     ```toml
     command = """
@@ -134,14 +134,15 @@ fix_command = ""        # plain shell on fix
 
 [[window]]
 name = "ai"
-command = "opencode --session \"ses_$GS_SESSION_SLUG\""
+command = "opencode --session ses_$GS_SESSION_SLUG"
 # no fix_command: fix runs the same command, which resumes the session
 ```
 
 `opencode --session <id>` continues the session with that ID, or creates it if
 it does not exist. With an ID built from `GS_SESSION_SLUG` (see below), `create`
 starts a new OpenCode session and `fix` reopens the same one. OpenCode
-session IDs must start with `ses`.
+session IDs must start with `ses`. The slug only contains characters that are
+safe in a shell, so it needs no quotes.
 
 The slug only depends on the names, so if you remove a session and create a
 new one with the same name, it reopens the old OpenCode session. Delete it
@@ -169,7 +170,9 @@ elsewhere that takes the repository as a target path:
 ```toml
 [[window]]
 name = "build"
-command = "pushd ~/tools && ./run-build.sh --target \"$GS_REPO_PATH\""
+command = """
+pushd ~/tools && ./run-build.sh --target "$GS_REPO_PATH"
+"""
 ```
 
 With tmux, both variables are also available in any interactive shell in the
