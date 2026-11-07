@@ -32,16 +32,16 @@ pub const WindowConfig = struct {
 };
 
 /// Builds a stable, shell- and ID-friendly slug identifying the session
-/// at `worktree_path` (`<root>/<repo>/<worktree>`), as `<repo>--<worktree>`
-/// (e.g. `my-app--fix-login`). Exported to session windows as
+/// at `worktree_path` (`<root>/<repo>/<worktree>`), as `<repo>.<worktree>`
+/// (e.g. `my-app.fix-login`). Exported to session windows as
 /// `GS_SESSION_SLUG` so commands can name resources after the session
 /// (e.g. `opencode --session "ses_$GS_SESSION_SLUG"`).
 ///
-/// In each part, ASCII letters, digits, `_` and `.` are kept as is; every
-/// run of other characters (including `-`) becomes a single `-`, trimmed
-/// at both ends. A part therefore never contains `--`, which keeps the
-/// separator unambiguous. A part left empty (e.g. a non-ASCII name) is
-/// replaced by a hex hash of its bytes. The caller owns the returned slice.
+/// In each part, ASCII letters, digits, `_` and `-` are kept as is; every
+/// run of other characters (including `.`) becomes a single `-`. A part
+/// therefore never contains `.`, which keeps the separator unambiguous.
+/// A part with no kept characters (e.g. a non-ASCII name) is replaced by
+/// a hex hash of its bytes. The caller owns the returned slice.
 pub fn sessionSlug(allocator: std.mem.Allocator, worktree_path: []const u8) ![]u8 {
     const trimmed = std.mem.trimEnd(u8, worktree_path, "/");
     const worktree = std.fs.path.basename(trimmed);
@@ -50,7 +50,7 @@ pub fn sessionSlug(allocator: std.mem.Allocator, worktree_path: []const u8) ![]u
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try appendSlugPart(allocator, &out, repo_name);
-    try out.appendSlice(allocator, "--");
+    try out.append(allocator, '.');
     try appendSlugPart(allocator, &out, worktree);
     return out.toOwnedSlice(allocator);
 }
@@ -58,15 +58,20 @@ pub fn sessionSlug(allocator: std.mem.Allocator, worktree_path: []const u8) ![]u
 /// Appends the slug form of one path component to `out` (see `sessionSlug`).
 fn appendSlugPart(allocator: std.mem.Allocator, out: *std.ArrayList(u8), part: []const u8) !void {
     const start = out.items.len;
+    var kept_any = false;
+    var in_replaced_run = false;
     for (part) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '.') {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-') {
             try out.append(allocator, c);
-        } else if (out.items.len > start and out.items[out.items.len - 1] != '-') {
+            kept_any = true;
+            in_replaced_run = false;
+        } else if (!in_replaced_run) {
             try out.append(allocator, '-');
+            in_replaced_run = true;
         }
     }
-    if (out.items.len > start and out.items[out.items.len - 1] == '-') _ = out.pop();
-    if (out.items.len == start) {
+    if (!kept_any) {
+        out.shrinkRetainingCapacity(start);
         var buf: [16]u8 = undefined;
         const hex = std.fmt.bufPrint(&buf, "{x:0>16}", .{std.hash.Wyhash.hash(0, part)}) catch unreachable;
         try out.appendSlice(allocator, hex);
@@ -1228,13 +1233,13 @@ test "loadRepoConfig frees everything when an allocation fails mid-parse" {
     try testing.expect(fail_index > 0);
 }
 
-test "sessionSlug joins repo and worktree names with --" {
+test "sessionSlug joins repo and worktree names with ." {
     const allocator = testing.allocator;
     const cases = [_]struct { path: []const u8, expected: []const u8 }{
-        .{ .path = "/root/my-app/fix-login", .expected = "my-app--fix-login" },
-        .{ .path = "/root/My_App/Fix.Login/", .expected = "My_App--Fix.Login" },
-        .{ .path = "/tmp/weird path;$(echo hi)", .expected = "tmp--weird-path-echo-hi" },
-        .{ .path = "/root/--repo--/a--b", .expected = "repo--a-b" },
+        .{ .path = "/root/my-app/fix-login", .expected = "my-app.fix-login" },
+        .{ .path = "/root/My_App/Fix.Login/", .expected = "My_App.Fix-Login" },
+        .{ .path = "/tmp/weird path;$(echo hi)", .expected = "tmp.weird-path-echo-hi-" },
+        .{ .path = "/root/--repo--/a--b", .expected = "--repo--.a--b" },
     };
     for (cases) |c| {
         const slug = try sessionSlug(allocator, c.path);
@@ -1245,8 +1250,8 @@ test "sessionSlug joins repo and worktree names with --" {
     // An empty part (here: no repo folder) becomes a 16-digit hex hash.
     const slug = try sessionSlug(allocator, "/wt");
     defer allocator.free(slug);
-    try testing.expectEqual(@as(usize, 16 + "--wt".len), slug.len);
-    try testing.expect(std.mem.endsWith(u8, slug, "--wt"));
+    try testing.expectEqual(@as(usize, 16 + ".wt".len), slug.len);
+    try testing.expect(std.mem.endsWith(u8, slug, ".wt"));
     for (slug[0..16]) |c| try testing.expect(std.ascii.isHex(c));
 }
 
@@ -1254,6 +1259,8 @@ test "sessionSlug keeps distinct names distinct" {
     const allocator = testing.allocator;
     const pairs = [_][2][]const u8{
         .{ "/r/app/foo_bar", "/r/app/foo-bar" },
+        .{ "/r/app/foo--bar", "/r/app/foo-bar" },
+        .{ "/r/app/foo-", "/r/app/foo" },
         .{ "/r/a-b/c", "/r/a/b-c" },
         .{ "/r/app/Login", "/r/app/login" },
         .{ "/r/app/日本", "/r/app/中文" },

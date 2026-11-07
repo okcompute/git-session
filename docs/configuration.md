@@ -153,9 +153,10 @@ Every window command runs with these environment variables set:
 
 - `GS_REPO_PATH`: the session's worktree folder.
 - `GS_SESSION_SLUG`: a stable slug made of the repository and session folder
-  names, joined by `--`. Letters, digits, `_` and `.` are kept, and every
-  other run of characters becomes a single `-`. For example,
-  `my-project/login-page` becomes `my-project--login-page`. It stays the same
+  names, joined by `.`. ASCII letters, digits, `_` and `-` are kept, and every
+  other run of characters becomes a single `-`. A name with none of the kept
+  characters is replaced by a 16-character hex hash. For example,
+  `my-project/login-page` becomes `my-project.login-page`. It stays the same
   across `create` and `fix`, so commands can use it to name things tied to the
   session.
 

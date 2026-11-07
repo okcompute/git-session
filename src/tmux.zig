@@ -566,11 +566,11 @@ test "buildNewSessionArgs sets GS_REPO_PATH to the worktree path" {
     const repo_path_env = try std.fmt.allocPrint(allocator, "GS_REPO_PATH={s}", .{worktree_path});
     defer allocator.free(repo_path_env);
 
-    const args = try buildNewSessionArgs(allocator, "sess", "editor", worktree_path, repo_path_env, "GS_SESSION_SLUG=repo--my-session");
+    const args = try buildNewSessionArgs(allocator, "sess", "editor", worktree_path, repo_path_env, "GS_SESSION_SLUG=repo.my-session");
     defer allocator.free(args);
 
     try testing.expectEqualDeep(
-        @as([]const []const u8, &.{ "tmux", "new-session", "-s", "sess", "-n", "editor", "-d", "-c", worktree_path, "-e", "GS_REPO_PATH=/home/user/repo/my-session", "-e", "GS_SESSION_SLUG=repo--my-session" }),
+        @as([]const []const u8, &.{ "tmux", "new-session", "-s", "sess", "-n", "editor", "-d", "-c", worktree_path, "-e", "GS_REPO_PATH=/home/user/repo/my-session", "-e", "GS_SESSION_SLUG=repo.my-session" }),
         args,
     );
     try expectRepoPathEnvArg(args, worktree_path);
@@ -582,11 +582,11 @@ test "buildNewWindowArgs sets GS_REPO_PATH to the worktree path" {
     const repo_path_env = try std.fmt.allocPrint(allocator, "GS_REPO_PATH={s}", .{worktree_path});
     defer allocator.free(repo_path_env);
 
-    const args = try buildNewWindowArgs(allocator, "sess", "logs", worktree_path, repo_path_env, "GS_SESSION_SLUG=repo--my-session");
+    const args = try buildNewWindowArgs(allocator, "sess", "logs", worktree_path, repo_path_env, "GS_SESSION_SLUG=repo.my-session");
     defer allocator.free(args);
 
     try testing.expectEqualDeep(
-        @as([]const []const u8, &.{ "tmux", "new-window", "-n", "logs", "-t", "sess", "-c", worktree_path, "-e", "GS_REPO_PATH=/home/user/repo/my-session", "-e", "GS_SESSION_SLUG=repo--my-session" }),
+        @as([]const []const u8, &.{ "tmux", "new-window", "-n", "logs", "-t", "sess", "-c", worktree_path, "-e", "GS_REPO_PATH=/home/user/repo/my-session", "-e", "GS_SESSION_SLUG=repo.my-session" }),
         args,
     );
     try expectRepoPathEnvArg(args, worktree_path);
@@ -600,7 +600,7 @@ test "buildNewSessionArgs passes worktree path with special characters verbatim"
     const repo_path_env = try std.fmt.allocPrint(allocator, "GS_REPO_PATH={s}", .{worktree_path});
     defer allocator.free(repo_path_env);
 
-    const args = try buildNewSessionArgs(allocator, "s", "w", worktree_path, repo_path_env, "GS_SESSION_SLUG=tmp--weird-path-echo-hi");
+    const args = try buildNewSessionArgs(allocator, "s", "w", worktree_path, repo_path_env, "GS_SESSION_SLUG=tmp.weird-path-echo-hi-");
     defer allocator.free(args);
 
     try expectRepoPathEnvArg(args, worktree_path);
