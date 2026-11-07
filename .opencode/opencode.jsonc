@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Personal project: use the personal Anthropic plan's models. Global agents
+  // are configured for the work account, so override every agent used here.
+  "model": "anthropic/claude-opus-5-5",
+  "agents": {
+    "general": { "model": "anthropic/claude-sonnet-5-5" },
+    "explore": { "model": "anthropic/claude-haiku-5-5" },
+    // Node.js-only global agent; not applicable to this Zig codebase.
+    "nodejs-test-writer": { "disabled": true },
+  },
+}
