@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Windows can set a `fix_command` that runs instead of `command` when a session is restored with `fix`. Without it, `fix` runs `command` as before. `fix_command = ""` opens a plain shell, for example to skip a build that only matters on first creation.
-- Window commands get a `GS_SESSION_SLUG` environment variable: a stable slug of the repository and session names (e.g. `my-project-login-page`). It lets a command name things after the session, such as `opencode --session "ses_$GS_SESSION_SLUG"`, which starts an OpenCode session on `create` and resumes it on `fix`.
+- Window commands get a `GS_SESSION_SLUG` environment variable: a stable slug of the repository and session names (e.g. `my-project--login-page`). It lets a command name things after the session, such as `opencode --session "ses_$GS_SESSION_SLUG"`, which starts an OpenCode session on `create` and resumes it on `fix`.
 
 ## [1.1.0] - 2026-11-04
 

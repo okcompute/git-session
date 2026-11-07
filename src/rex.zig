@@ -800,11 +800,11 @@ test "buildListSessionsArgs" {
 }
 
 test "buildNewSessionArgs labels the session and first window and starts the shell with GS_REPO_PATH and GS_SESSION_SLUG" {
-    const args = try buildNewSessionArgs(testing.allocator, "rex", "app · fix-it", "editor", "/w/fix-it", "GS_REPO_PATH=/w/fix-it", "GS_SESSION_SLUG=w-fix-it", "/bin/zsh");
+    const args = try buildNewSessionArgs(testing.allocator, "rex", "app · fix-it", "editor", "/w/fix-it", "GS_REPO_PATH=/w/fix-it", "GS_SESSION_SLUG=w--fix-it", "/bin/zsh");
     defer testing.allocator.free(args);
     try expectArgv(&.{
         "rex",     "--autostart=false", "new",    "app · fix-it", "--window",     "editor",                 "--cwd",                    "/w/fix-it",
-        "--shell", "none",              "--json", "--",           "/usr/bin/env", "GS_REPO_PATH=/w/fix-it", "GS_SESSION_SLUG=w-fix-it", "/bin/zsh",
+        "--shell", "none",              "--json", "--",           "/usr/bin/env", "GS_REPO_PATH=/w/fix-it", "GS_SESSION_SLUG=w--fix-it", "/bin/zsh",
         "-l",
     }, args);
 }
@@ -812,19 +812,20 @@ test "buildNewSessionArgs labels the session and first window and starts the she
 test "buildNewSessionArgs passes a worktree path with special characters verbatim" {
     const path = "/tmp/weird path;$(echo hi)";
     const env_arg = "GS_REPO_PATH=" ++ path;
-    const args = try buildNewSessionArgs(testing.allocator, "rex", "s", "w", path, env_arg, "GS_SESSION_SLUG=tmp-weird-path-echo-hi", "/bin/sh");
+    const args = try buildNewSessionArgs(testing.allocator, "rex", "s", "w", path, env_arg, "GS_SESSION_SLUG=tmp--weird-path-echo-hi", "/bin/sh");
     defer testing.allocator.free(args);
     // The path must be single, discrete argv elements, never part of a shell string.
     try testing.expectEqualStrings(path, args[7]);
     try testing.expectEqualStrings(env_arg, args[13]);
+    try testing.expectEqualStrings("GS_SESSION_SLUG=tmp--weird-path-echo-hi", args[14]);
 }
 
 test "buildNewWindowArgs adds an unfocused, labelled window to the session" {
-    const args = try buildNewWindowArgs(testing.allocator, "rex", "session:abc", "logs", "/w/s", "GS_REPO_PATH=/w/s", "GS_SESSION_SLUG=w-s", "/bin/zsh");
+    const args = try buildNewWindowArgs(testing.allocator, "rex", "session:abc", "logs", "/w/s", "GS_REPO_PATH=/w/s", "GS_SESSION_SLUG=w--s", "/bin/zsh");
     defer testing.allocator.free(args);
     try expectArgv(&.{
         "rex",           "--autostart=false", "window", "new",    "-s", "session:abc",  "logs",              "--cwd",               "/w/s",
-        "--focus=false", "--shell",           "none",   "--json", "--", "/usr/bin/env", "GS_REPO_PATH=/w/s", "GS_SESSION_SLUG=w-s", "/bin/zsh",
+        "--focus=false", "--shell",           "none",   "--json", "--", "/usr/bin/env", "GS_REPO_PATH=/w/s", "GS_SESSION_SLUG=w--s", "/bin/zsh",
         "-l",
     }, args);
 }

@@ -32,11 +32,16 @@ pub const WindowConfig = struct {
 };
 
 /// Builds a stable, shell- and ID-friendly slug identifying the session
-/// at `worktree_path` (`<root>/<repo>/<worktree>`), e.g. `my-app-fix-login`.
-/// Exported to session windows as `GS_SESSION_SLUG` so commands can name
-/// resources after the session (e.g. `opencode --session "ses_$GS_SESSION_SLUG"`).
-/// Lowercase ASCII letters and digits are kept; every other run of
-/// characters becomes a single `-`. The caller owns the returned slice.
+/// at `worktree_path` (`<root>/<repo>/<worktree>`), as `<repo>--<worktree>`
+/// (e.g. `my-app--fix-login`). Exported to session windows as
+/// `GS_SESSION_SLUG` so commands can name resources after the session
+/// (e.g. `opencode --session "ses_$GS_SESSION_SLUG"`).
+///
+/// In each part, ASCII letters, digits, `_` and `.` are kept as is; every
+/// run of other characters (including `-`) becomes a single `-`, trimmed
+/// at both ends. A part therefore never contains `--`, which keeps the
+/// separator unambiguous. A part left empty (e.g. a non-ASCII name) is
+/// replaced by a hex hash of its bytes. The caller owns the returned slice.
 pub fn sessionSlug(allocator: std.mem.Allocator, worktree_path: []const u8) ![]u8 {
     const trimmed = std.mem.trimEnd(u8, worktree_path, "/");
     const worktree = std.fs.path.basename(trimmed);
@@ -44,18 +49,28 @@ pub fn sessionSlug(allocator: std.mem.Allocator, worktree_path: []const u8) ![]u
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    for ([_][]const u8{ repo_name, worktree }) |part| {
-        for (part) |c| {
-            if (std.ascii.isAlphanumeric(c)) {
-                try out.append(allocator, std.ascii.toLower(c));
-            } else if (out.items.len > 0 and out.items[out.items.len - 1] != '-') {
-                try out.append(allocator, '-');
-            }
-        }
-        if (out.items.len > 0 and out.items[out.items.len - 1] != '-') try out.append(allocator, '-');
-    }
-    if (out.items.len > 0 and out.items[out.items.len - 1] == '-') _ = out.pop();
+    try appendSlugPart(allocator, &out, repo_name);
+    try out.appendSlice(allocator, "--");
+    try appendSlugPart(allocator, &out, worktree);
     return out.toOwnedSlice(allocator);
+}
+
+/// Appends the slug form of one path component to `out` (see `sessionSlug`).
+fn appendSlugPart(allocator: std.mem.Allocator, out: *std.ArrayList(u8), part: []const u8) !void {
+    const start = out.items.len;
+    for (part) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '.') {
+            try out.append(allocator, c);
+        } else if (out.items.len > start and out.items[out.items.len - 1] != '-') {
+            try out.append(allocator, '-');
+        }
+    }
+    if (out.items.len > start and out.items[out.items.len - 1] == '-') _ = out.pop();
+    if (out.items.len == start) {
+        var buf: [16]u8 = undefined;
+        const hex = std.fmt.bufPrint(&buf, "{x:0>16}", .{std.hash.Wyhash.hash(0, part)}) catch unreachable;
+        try out.appendSlice(allocator, hex);
+    }
 }
 
 /// Per-repository configuration loaded from `.git-session.toml`.
@@ -99,6 +114,15 @@ fn parseRepoConfigFile(allocator: std.mem.Allocator, io: std.Io, filepath: []con
     var cur_win_name: []const u8 = "";
     var cur_win_cmds: std.ArrayList([]const u8) = .empty;
     var cur_win_fix_cmds: ?std.ArrayList([]const u8) = null;
+    // On error, free everything parsed so far. The window being built is
+    // owned locally until it is appended to `cfg.windows` (after which the
+    // locals are reset), so neither part is freed twice.
+    errdefer {
+        if (cur_win_name.len > 0) allocator.free(cur_win_name);
+        freeCommandList(allocator, &cur_win_cmds);
+        if (cur_win_fix_cmds) |*fc| freeCommandList(allocator, fc);
+        freeRepoConfig(allocator, &cfg);
+    }
 
     // The command list a triple-quoted multi-line string (`command` or
     // `fix_command`) is being collected into, or null outside of one.
@@ -117,7 +141,7 @@ fn parseRepoConfigFile(allocator: std.mem.Allocator, io: std.Io, filepath: []con
             }
             // Add non-empty lines as individual commands
             if (trimmed.len > 0) {
-                try target.append(allocator, try allocator.dupe(u8, trimmed));
+                try appendDupe(allocator, target, trimmed);
             }
             continue;
         }
@@ -203,23 +227,36 @@ fn appendCommandValue(allocator: std.mem.Allocator, cmds: *std.ArrayList([]const
             const inner = after_quotes[0 .. after_quotes.len - 3];
             const trimmed_inner = std.mem.trim(u8, inner, " \t");
             if (trimmed_inner.len > 0) {
-                try cmds.append(allocator, try allocator.dupe(u8, trimmed_inner));
+                try appendDupe(allocator, cmds, trimmed_inner);
             }
             return false;
         }
         // Start of multi-line: command = """
         // If there's content after """ on the same line, capture it
         if (after_quotes.len > 0) {
-            try cmds.append(allocator, try allocator.dupe(u8, after_quotes));
+            try appendDupe(allocator, cmds, after_quotes);
         }
         return true;
     }
     // Single command: command = "vim"
     const cmd = config.stripQuotes(value_raw);
     if (cmd.len > 0) {
-        try cmds.append(allocator, try allocator.dupe(u8, cmd));
+        try appendDupe(allocator, cmds, cmd);
     }
     return false;
+}
+
+/// Appends a heap copy of `s` to `list`, freeing the copy if the append fails.
+fn appendDupe(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), s: []const u8) !void {
+    const copy = try allocator.dupe(u8, s);
+    errdefer allocator.free(copy);
+    try list.append(allocator, copy);
+}
+
+/// Frees a list of heap-allocated commands built by the parser.
+fn freeCommandList(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
+    for (list.items) |cmd| allocator.free(cmd);
+    list.deinit(allocator);
 }
 
 /// Loads only the centralized per-repo config for `repo_name` from
@@ -283,12 +320,8 @@ pub fn freeRepoConfig(allocator: std.mem.Allocator, cfg: *RepoConfig) void {
     cfg.branch_prefixes.deinit(allocator);
     for (cfg.windows.items) |*w| {
         if (w.name.len > 0) allocator.free(w.name);
-        for (w.commands.items) |cmd| allocator.free(cmd);
-        w.commands.deinit(allocator);
-        if (w.fix_commands) |*fc| {
-            for (fc.items) |cmd| allocator.free(cmd);
-            fc.deinit(allocator);
-        }
+        freeCommandList(allocator, &w.commands);
+        if (w.fix_commands) |*fc| freeCommandList(allocator, fc);
     }
     cfg.windows.deinit(allocator);
     if (cfg.origin_url.len > 0) allocator.free(cfg.origin_url);
@@ -1110,7 +1143,7 @@ test "loadRepoConfig parses fix_command and commandsFor picks per mode" {
     try testing.expectEqualDeep(@as([]const []const u8, &.{"zig build"}), build.commandsFor(.create));
     try testing.expectEqual(@as(usize, 0), build.commandsFor(.fix).len);
 
-    // A multi-line fix_command, declared before command, stays separate.
+    // A multi-line fix_command declared before command stays separate from it.
     try testing.expectEqualDeep(@as([]const []const u8, &.{"opencode"}), ai.commandsFor(.create));
     try testing.expectEqualDeep(@as([]const []const u8, &.{ "git status", "opencode --continue" }), ai.commandsFor(.fix));
 
@@ -1119,18 +1152,119 @@ test "loadRepoConfig parses fix_command and commandsFor picks per mode" {
     try testing.expectEqualDeep(@as([]const []const u8, &.{"vim"}), editor.commandsFor(.fix));
 }
 
-test "sessionSlug combines repo and worktree names into a lowercase slug" {
+test "loadRepoConfig parses single-line and inline-start fix_command forms" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const toml =
+        \\bare_repo = "app"
+        \\
+        \\[[window]]
+        \\name = "a"
+        \\fix_command = """opencode --continue"""
+        \\
+        \\[[window]]
+        \\name = "b"
+        \\fix_command = """first
+        \\second
+        \\"""
+        \\fix_command = "third"
+    ;
+    writeTmpFile(&tmp, repo_config_filename, toml);
+
+    const allocator = testing.allocator;
+    var test_env = try std.process.Environ.createMap(testing.environ, allocator);
+    defer test_env.deinit();
+    const path = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(path);
+
+    var cfg = try loadRepoConfig(allocator, testing.io, &test_env, path);
+    defer freeRepoConfig(allocator, &cfg);
+
+    try testing.expectEqualDeep(@as([]const []const u8, &.{"opencode --continue"}), cfg.windows.items[0].commandsFor(.fix));
+    // Repeated keys append, like `command`.
+    try testing.expectEqualDeep(@as([]const []const u8, &.{ "first", "second", "third" }), cfg.windows.items[1].commandsFor(.fix));
+}
+
+test "loadRepoConfig frees everything when an allocation fails mid-parse" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const toml =
+        \\bare_repo = "app"
+        \\start_branches = ["main"]
+        \\
+        \\[[window]]
+        \\name = "build"
+        \\command = "zig build"
+        \\fix_command = ""
+        \\
+        \\[[window]]
+        \\name = "ai"
+        \\command = """
+        \\git status
+        \\opencode
+        \\"""
+        \\fix_command = "opencode --continue"
+    ;
+    writeTmpFile(&tmp, repo_config_filename, toml);
+
+    var test_env = try std.process.Environ.createMap(testing.environ, testing.allocator);
+    defer test_env.deinit();
+    const path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+
+    // Fail each allocation in turn; testing.allocator reports any leak.
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+        if (loadRepoConfig(allocator, testing.io, &test_env, path)) |cfg_value| {
+            var cfg = cfg_value;
+            freeRepoConfig(allocator, &cfg);
+            break;
+        } else |_| {}
+    }
+    try testing.expect(fail_index > 0);
+}
+
+test "sessionSlug joins repo and worktree names with --" {
     const allocator = testing.allocator;
     const cases = [_]struct { path: []const u8, expected: []const u8 }{
-        .{ .path = "/root/my-app/fix-login", .expected = "my-app-fix-login" },
-        .{ .path = "/root/My_App/Fix.Login/", .expected = "my-app-fix-login" },
-        .{ .path = "/tmp/weird path;$(echo hi)", .expected = "tmp-weird-path-echo-hi" },
-        .{ .path = "/root/--repo--/__wt__", .expected = "repo-wt" },
+        .{ .path = "/root/my-app/fix-login", .expected = "my-app--fix-login" },
+        .{ .path = "/root/My_App/Fix.Login/", .expected = "My_App--Fix.Login" },
+        .{ .path = "/tmp/weird path;$(echo hi)", .expected = "tmp--weird-path-echo-hi" },
+        .{ .path = "/root/--repo--/a--b", .expected = "repo--a-b" },
     };
     for (cases) |c| {
         const slug = try sessionSlug(allocator, c.path);
         defer allocator.free(slug);
         try testing.expectEqualStrings(c.expected, slug);
+    }
+
+    // An empty part (here: no repo folder) becomes a 16-digit hex hash.
+    const slug = try sessionSlug(allocator, "/wt");
+    defer allocator.free(slug);
+    try testing.expectEqual(@as(usize, 16 + "--wt".len), slug.len);
+    try testing.expect(std.mem.endsWith(u8, slug, "--wt"));
+    for (slug[0..16]) |c| try testing.expect(std.ascii.isHex(c));
+}
+
+test "sessionSlug keeps distinct names distinct" {
+    const allocator = testing.allocator;
+    const pairs = [_][2][]const u8{
+        .{ "/r/app/foo_bar", "/r/app/foo-bar" },
+        .{ "/r/a-b/c", "/r/a/b-c" },
+        .{ "/r/app/Login", "/r/app/login" },
+        .{ "/r/app/日本", "/r/app/中文" },
+    };
+    for (pairs) |p| {
+        const a = try sessionSlug(allocator, p[0]);
+        defer allocator.free(a);
+        const b = try sessionSlug(allocator, p[1]);
+        defer allocator.free(b);
+        try testing.expect(!std.mem.eql(u8, a, b));
+        try testing.expect(a.len > 0 and b.len > 0);
     }
 }
 

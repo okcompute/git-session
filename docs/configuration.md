@@ -143,16 +143,21 @@ it does not exist. With an ID built from `GS_SESSION_SLUG` (see below), `create`
 starts a new OpenCode session and `fix` reopens the same one. OpenCode
 session IDs must start with `ses`.
 
+The slug only depends on the names, so if you remove a session and create a
+new one with the same name, it reopens the old OpenCode session. Delete it
+first with `opencode session delete "ses_<slug>"` if you want a fresh start.
+
 ### Environment variables
 
 Every window command runs with these environment variables set:
 
 - `GS_REPO_PATH`: the session's worktree folder.
-- `GS_SESSION_SLUG`: a stable slug made of the repository and session names,
-  lowercase, with every run of characters other than letters and digits
-  replaced by `-`. For example, `my-project/login-page` becomes
-  `my-project-login-page`. It stays the same across `create` and `fix`, so
-  commands can use it to name things tied to the session.
+- `GS_SESSION_SLUG`: a stable slug made of the repository and session folder
+  names, joined by `--`. Letters, digits, `_` and `.` are kept, and every
+  other run of characters becomes a single `-`. For example,
+  `my-project/login-page` becomes `my-project--login-page`. It stays the same
+  across `create` and `fix`, so commands can use it to name things tied to the
+  session.
 
 Commands already start with their working directory set to the worktree, so you
 do not need `GS_REPO_PATH` to reference files in the repository directly (just
