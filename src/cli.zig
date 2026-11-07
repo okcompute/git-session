@@ -747,7 +747,7 @@ fn runCreateNonInteractive(
     const tmux_name = try multiplexer.sessionName(allocator, session_name, branch_name, selected.name);
     defer allocator.free(tmux_name);
 
-    multiplexer.createSession(allocator, io, env, tmux_name, wt_path, selected.config.windows.items) catch |err| {
+    multiplexer.createSession(allocator, io, env, tmux_name, wt_path, selected.config.windows.items, .create) catch |err| {
         _ = git.gitRemoveWorktree(allocator, io, bare_repo_path, session_name) catch {};
         repo.deleteSessionFile(allocator, io, bare_repo_path, session_name);
         term.eprint(io, "Error: failed to create {s} session.\n", .{multiplexer.displayName()});
@@ -1260,7 +1260,7 @@ fn runFixNonInteractive(
     defer allocator.free(tmux_name);
 
     term.print(io, "Recreating {s} session for '{s}'...\n", .{ multiplexer.displayName(), session_name });
-    multiplexer.createSession(allocator, io, env, tmux_name, wt_path, selected.config.windows.items) catch |err| {
+    multiplexer.createSession(allocator, io, env, tmux_name, wt_path, selected.config.windows.items, .fix) catch |err| {
         term.eprint(io, "Error: failed to create {s} session.\n", .{multiplexer.displayName()});
         std.process.exit(exitCodeFor(err));
     };

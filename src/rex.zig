@@ -45,7 +45,12 @@ pub const exit_server_unreachable: u8 = 4;
 /// holding the worktree path so window commands can reference it.
 const gs_repo_path_var = "GS_REPO_PATH";
 
-/// Program used to inject GS_REPO_PATH into each window's shell.
+/// The environment-variable name exported to every session window,
+/// holding `repo.sessionSlug` of the worktree.
+const gs_session_slug_var = "GS_SESSION_SLUG";
+
+/// Program used to inject GS_REPO_PATH and GS_SESSION_SLUG into each
+/// window's shell.
 const env_program = "/usr/bin/env";
 
 /// Shell used when `$SHELL` is not set.
@@ -179,8 +184,9 @@ fn buildListSessionsArgs(allocator: std.mem.Allocator, bin: []const u8) ![]const
 }
 
 /// `rex new`: creates the session and its first window (labelled
-/// `window_name`), whose shell starts in `cwd` with GS_REPO_PATH set.
-/// `repo_path_env` must be of the form "GS_REPO_PATH=<path>".
+/// `window_name`), whose shell starts in `cwd` with GS_REPO_PATH and
+/// GS_SESSION_SLUG set. `repo_path_env` / `slug_env` must be of the form
+/// "GS_REPO_PATH=<path>" / "GS_SESSION_SLUG=<slug>".
 fn buildNewSessionArgs(
     allocator: std.mem.Allocator,
     bin: []const u8,
@@ -188,18 +194,19 @@ fn buildNewSessionArgs(
     window_name: []const u8,
     cwd: []const u8,
     repo_path_env: []const u8,
+    slug_env: []const u8,
     shell: []const u8,
 ) ![]const []const u8 {
     return allocator.dupe([]const u8, &.{
         bin,        no_autostart, "new",  label,      "--window",    window_name, "--cwd", cwd,
-        "--shell",  "none",       "--json", "--",     env_program,   repo_path_env, shell, "-l",
+        "--shell",  "none",       "--json", "--",     env_program,   repo_path_env, slug_env, shell, "-l",
     });
 }
 
 /// `rex window new`: adds a window (tab) labelled `window_name` to the
 /// session without focusing it; its shell starts in `cwd` with
-/// GS_REPO_PATH set. `rex run --label` would set the block label instead
-/// of the window label, hence `window new`.
+/// GS_REPO_PATH and GS_SESSION_SLUG set. `rex run --label` would set the
+/// block label instead of the window label, hence `window new`.
 fn buildNewWindowArgs(
     allocator: std.mem.Allocator,
     bin: []const u8,
@@ -207,11 +214,12 @@ fn buildNewWindowArgs(
     window_name: []const u8,
     cwd: []const u8,
     repo_path_env: []const u8,
+    slug_env: []const u8,
     shell: []const u8,
 ) ![]const []const u8 {
     return allocator.dupe([]const u8, &.{
         bin,     no_autostart, "window", "new",   "-s",   session_id, window_name,  "--cwd", cwd,
-        "--focus=false", "--shell", "none", "--json", "--", env_program, repo_path_env, shell, "-l",
+        "--focus=false", "--shell", "none", "--json", "--", env_program, repo_path_env, slug_env, shell, "-l",
     });
 }
 
@@ -491,9 +499,10 @@ pub const Rex = struct {
 
     /// Creates a session labelled `label` with one window per entry in
     /// `windows` (or a single "shell" window when empty), each starting in
-    /// `worktree_path` with GS_REPO_PATH set, and types each window's
-    /// commands into its shell. The first window ends up focused. Prints a
-    /// message and returns without error when the session already exists.
+    /// `worktree_path` with GS_REPO_PATH and GS_SESSION_SLUG set, and types
+    /// each window's commands for `mode` into its shell. The first window
+    /// ends up focused. Prints a message and returns without error when the
+    /// session already exists.
     pub fn createSession(
         self: Rex,
         allocator: std.mem.Allocator,
@@ -502,6 +511,7 @@ pub const Rex = struct {
         label: []const u8,
         worktree_path: []const u8,
         windows: []const repo.WindowConfig,
+        mode: repo.SessionMode,
     ) !void {
         if (self.sessionExists(allocator, io, label)) {
             // Unlike tmux, a Rex session outlives its last tab. An empty one
@@ -519,9 +529,13 @@ pub const Rex = struct {
 
         const repo_path_env = try std.fmt.allocPrint(allocator, "{s}={s}", .{ gs_repo_path_var, worktree_path });
         defer allocator.free(repo_path_env);
+        const slug = try repo.sessionSlug(allocator, worktree_path);
+        defer allocator.free(slug);
+        const slug_env = try std.fmt.allocPrint(allocator, "{s}={s}", .{ gs_session_slug_var, slug });
+        defer allocator.free(slug_env);
         const shell = loginShell(env);
 
-        const new_session_args = try buildNewSessionArgs(allocator, self.bin, label, effective_name, worktree_path, repo_path_env, shell);
+        const new_session_args = try buildNewSessionArgs(allocator, self.bin, label, effective_name, worktree_path, repo_path_env, slug_env, shell);
         defer allocator.free(new_session_args);
         const r = try self.run(allocator, io, new_session_args);
         defer process.freeExecResult(allocator, r);
@@ -540,13 +554,13 @@ pub const Rex = struct {
         defer created.deinit(allocator);
 
         if (windows.len > 0) {
-            self.typeCommands(allocator, io, created.session_id, created.window_id, windows[0].commands.items);
+            self.typeCommands(allocator, io, created.session_id, created.window_id, windows[0].commandsFor(mode));
         }
 
         if (windows.len > 1) {
             for (windows[1..]) |win| {
                 const win_name = if (win.name.len > 0) win.name else "shell";
-                const new_window_args = try buildNewWindowArgs(allocator, self.bin, created.session_id, win_name, worktree_path, repo_path_env, shell);
+                const new_window_args = try buildNewWindowArgs(allocator, self.bin, created.session_id, win_name, worktree_path, repo_path_env, slug_env, shell);
                 defer allocator.free(new_window_args);
                 const wr = self.run(allocator, io, new_window_args) catch continue;
                 defer process.freeExecResult(allocator, wr);
@@ -556,7 +570,7 @@ pub const Rex = struct {
                 }
                 const window_id = parseCreatedWindowId(allocator, wr.stdout_data) catch continue;
                 defer allocator.free(window_id);
-                self.typeCommands(allocator, io, created.session_id, window_id, win.commands.items);
+                self.typeCommands(allocator, io, created.session_id, window_id, win.commandsFor(mode));
             }
         }
 
@@ -785,31 +799,34 @@ test "buildListSessionsArgs" {
     try expectArgv(&.{ "rex", "--autostart=false", "ls", "--json" }, args);
 }
 
-test "buildNewSessionArgs labels the session and first window and starts the shell with GS_REPO_PATH" {
-    const args = try buildNewSessionArgs(testing.allocator, "rex", "app · fix-it", "editor", "/w/fix-it", "GS_REPO_PATH=/w/fix-it", "/bin/zsh");
+test "buildNewSessionArgs labels the session and first window and starts the shell with GS_REPO_PATH and GS_SESSION_SLUG" {
+    const args = try buildNewSessionArgs(testing.allocator, "rex", "app · fix-it", "editor", "/w/fix-it", "GS_REPO_PATH=/w/fix-it", "GS_SESSION_SLUG=w.fix-it", "/bin/zsh");
     defer testing.allocator.free(args);
     try expectArgv(&.{
-        "rex",          "--autostart=false", "new",    "app · fix-it",           "--window", "editor", "--cwd", "/w/fix-it",
-        "--shell",      "none",              "--json", "--",                      "/usr/bin/env", "GS_REPO_PATH=/w/fix-it", "/bin/zsh", "-l",
+        "rex",     "--autostart=false", "new",    "app · fix-it", "--window",     "editor",                 "--cwd",                    "/w/fix-it",
+        "--shell", "none",              "--json", "--",           "/usr/bin/env", "GS_REPO_PATH=/w/fix-it", "GS_SESSION_SLUG=w.fix-it", "/bin/zsh",
+        "-l",
     }, args);
 }
 
 test "buildNewSessionArgs passes a worktree path with special characters verbatim" {
     const path = "/tmp/weird path;$(echo hi)";
     const env_arg = "GS_REPO_PATH=" ++ path;
-    const args = try buildNewSessionArgs(testing.allocator, "rex", "s", "w", path, env_arg, "/bin/sh");
+    const args = try buildNewSessionArgs(testing.allocator, "rex", "s", "w", path, env_arg, "GS_SESSION_SLUG=tmp.weird-path-echo-hi-", "/bin/sh");
     defer testing.allocator.free(args);
     // The path must be single, discrete argv elements, never part of a shell string.
     try testing.expectEqualStrings(path, args[7]);
     try testing.expectEqualStrings(env_arg, args[13]);
+    try testing.expectEqualStrings("GS_SESSION_SLUG=tmp.weird-path-echo-hi-", args[14]);
 }
 
 test "buildNewWindowArgs adds an unfocused, labelled window to the session" {
-    const args = try buildNewWindowArgs(testing.allocator, "rex", "session:abc", "logs", "/w/s", "GS_REPO_PATH=/w/s", "/bin/zsh");
+    const args = try buildNewWindowArgs(testing.allocator, "rex", "session:abc", "logs", "/w/s", "GS_REPO_PATH=/w/s", "GS_SESSION_SLUG=w.s", "/bin/zsh");
     defer testing.allocator.free(args);
     try expectArgv(&.{
-        "rex",           "--autostart=false", "window", "new",    "-s", "session:abc",  "logs",              "--cwd",    "/w/s",
-        "--focus=false", "--shell",           "none",   "--json", "--", "/usr/bin/env", "GS_REPO_PATH=/w/s", "/bin/zsh", "-l",
+        "rex",           "--autostart=false", "window", "new",    "-s", "session:abc",  "logs",              "--cwd",               "/w/s",
+        "--focus=false", "--shell",           "none",   "--json", "--", "/usr/bin/env", "GS_REPO_PATH=/w/s", "GS_SESSION_SLUG=w.s", "/bin/zsh",
+        "-l",
     }, args);
 }
 

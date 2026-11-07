@@ -124,8 +124,9 @@ pub const Mux = union(Kind) {
         };
     }
 
-    /// Creates the session with one window per `windows` entry. Does
-    /// nothing (besides printing a message) when it already exists.
+    /// Creates the session with one window per `windows` entry, typing
+    /// each window's commands for `mode` (see `WindowConfig.commandsFor`).
+    /// Does nothing (besides printing a message) when it already exists.
     pub fn createSession(
         self: Mux,
         allocator: std.mem.Allocator,
@@ -134,10 +135,11 @@ pub const Mux = union(Kind) {
         name: []const u8,
         worktree_path: []const u8,
         windows: []const repo.WindowConfig,
+        mode: repo.SessionMode,
     ) !void {
         return switch (self) {
-            .tmux => tmux.tmuxCreateSession(allocator, io, name, worktree_path, windows),
-            .rex => |r| r.createSession(allocator, io, env, name, worktree_path, windows),
+            .tmux => tmux.tmuxCreateSession(allocator, io, name, worktree_path, windows, mode),
+            .rex => |r| r.createSession(allocator, io, env, name, worktree_path, windows, mode),
         };
     }
 
