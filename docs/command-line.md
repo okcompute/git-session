@@ -25,11 +25,13 @@ git-session config remove-root [<path>] [--yes | -y]
 | `--version`, `-v` | Print the version and exit. |
 | `help`, `--help`, `-h` | Print usage and exit. |
 | `--repository <name>` | (TUI mode) Pre-select a repository and open the TUI at its action menu. |
-| `--multiplexer <rex\|tmux>` | Use this multiplexer for this run, overriding `multiplexer` in `config.toml` and `REX_SESSION`/`TMUX` detection. Accepted anywhere on the command line. Ignored by `config`, `config add-root`, and `add-repo`. |
+| `--multiplexer <rex\|tmux>` | Use this multiplexer for this run, overriding `multiplexer` in `config.toml` and `REX_SESSION`/`TMUX` detection. Accepted anywhere on the command line. Ignored by `config`, `config add-root`, and `add-repo`; `config remove-root` honours it when it cascades into removing sessions. |
 
 ## Terminal multiplexer
 
 Sessions run in tmux by default, or in [Rex](https://www.superlogical.com/rex/docs.md) when `--multiplexer rex` is passed, when `multiplexer = "rex"` is set in `~/.config/git-session/config.toml`, or when git-session runs in a Rex terminal outside tmux and neither is set. Below, "tmux session" means "Rex session" when Rex is selected. See [Terminal multiplexer](configuration.md#terminal-multiplexer) for how the backend is chosen and what Rex requires.
+
+tmux rewrites `.` and `:` to `_` in session names, so a repository or worktree whose name contains those characters appears in tmux under the rewritten name; git-session targets that name.
 
 ## Session subcommands
 
@@ -294,6 +296,8 @@ The last remaining root cannot be removed.
 | `--replace` used with `create` or `remove` | Prints `Error: --replace is only valid with 'fix'` and usage, exits with code 1. |
 | `--replace` used without `--session` | Prints `Error: --replace requires --session` and usage, exits with code 1. |
 | `fix --replace` run from inside the session being replaced | Prints `Error: cannot replace the session git-session is running in ('<name>').` and exits with code 1 without touching the session. |
+| `fix --replace` when the current session cannot be determined | Prints `Error: could not determine the current <tmux\|Rex> session; refusing to replace '<name>'.` and exits with code 1 without touching the session. |
+| `fix --replace` when the session survives the close | Prints `Error: the existing <tmux\|Rex> session could not be closed.` and exits with code 1 instead of recreating it. |
 | Rex selected but the `rex` CLI is not on `PATH` or in `$REX_BIN_DIR` | Prints an error explaining how to make it available, exits with code 1. |
 | Rex selected but the Rex server is not running (the app is not open) | Prints `the Rex server is not running`, exits with code 4. Applies to the TUI, `create`, `remove`, `fix`, and `remove-repo`, and nothing is changed on disk. |
 | Showing the session in Rex fails (Remote Control off) | Prints a hint; the session itself was created successfully (exit code 0). |

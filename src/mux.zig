@@ -124,6 +124,19 @@ pub const Mux = union(Kind) {
         };
     }
 
+    /// Returns the name the backend stores for the session git-session
+    /// would name `name`. tmux rewrites `.` and `:` to `_`, so an existing
+    /// session has to be targeted by the rewritten name; Rex stores labels
+    /// verbatim.
+    /// The returned slice is heap-allocated; the caller must free it with
+    /// `allocator.free`.
+    pub fn storedSessionName(self: Mux, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+        return switch (self) {
+            .tmux => tmux.tmuxStoredSessionName(allocator, name),
+            .rex => allocator.dupe(u8, name),
+        };
+    }
+
     /// Creates the session with one window per `windows` entry, typing
     /// each window's commands for `mode` (see `WindowConfig.commandsFor`).
     /// Does nothing (besides printing a message) when it already exists.
@@ -595,6 +608,22 @@ test "rex.isCurrentSession matches REX_SESSION across duplicate labels" {
     try testing.expect(rex.isCurrentSession(sessions, "session:2", "app · login"));
     try testing.expect(!rex.isCurrentSession(sessions, "session:1", "app · login"));
     try testing.expect(!rex.isCurrentSession(sessions, "session:99", "app · login"));
+}
+
+test "Mux.storedSessionName folds for tmux and copies for Rex" {
+    const allocator = testing.allocator;
+
+    const t: Mux = .tmux;
+    const folded = try t.storedSessionName(allocator, "(my.app) - x");
+    defer allocator.free(folded);
+    try testing.expectEqualStrings("(my_app) - x", folded);
+
+    const r: Mux = .{ .rex = .{ .bin = "rex" } };
+    const label = try r.storedSessionName(allocator, "app · wt");
+    defer allocator.free(label);
+    try testing.expectEqualStrings("app · wt", label);
+    // Rex labels are copied, not aliased, so the caller can free freely.
+    try testing.expect(label.ptr != "app · wt".ptr);
 }
 
 test "Mux.isCurrentSession distinguishes outside from lookup failure" {

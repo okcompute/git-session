@@ -298,6 +298,21 @@ fn foldSessionChar(c: u8) u8 {
     return if (c == '.' or c == ':') '_' else c;
 }
 
+/// Returns the name tmux stores for a session created as `computed`.
+///
+/// tmux rewrites `.` and `:` to `_` in session names, and it parses a `.`
+/// in a `-t` target as a window/pane separator, so commands like
+/// `has-session` and `kill-session` must be given the rewritten name or
+/// they fail with "can't find pane" on a repo or worktree containing
+/// those characters.
+/// The returned slice is heap-allocated; the caller must free it with
+/// `allocator.free`.
+pub fn tmuxStoredSessionName(allocator: std.mem.Allocator, computed: []const u8) ![]u8 {
+    const stored = try allocator.alloc(u8, computed.len);
+    for (computed, 0..) |c, i| stored[i] = foldSessionChar(c);
+    return stored;
+}
+
 /// Returns `true` when a tmux client is currently attached to the given
 /// session. Uses `tmux list-clients -t <session_name>` which only
 /// returns clients viewing that session. This is more reliable than
@@ -550,6 +565,26 @@ test "sessionNameMatches folds the characters tmux rewrites" {
     try testing.expect(sessionNameMatches("(app) - x", "(app) - x"));
     try testing.expect(!sessionNameMatches("(app) - x", "(app) - y"));
     try testing.expect(!sessionNameMatches("(app) - x", "(app) - xx"));
+}
+
+test "tmuxStoredSessionName rewrites the characters tmux folds" {
+    const allocator = testing.allocator;
+
+    const dotted = try tmuxStoredSessionName(allocator, "(my.app) - x");
+    defer allocator.free(dotted);
+    try testing.expectEqualStrings("(my_app) - x", dotted);
+
+    const colon = try tmuxStoredSessionName(allocator, "(app) - a:b");
+    defer allocator.free(colon);
+    try testing.expectEqualStrings("(app) - a_b", colon);
+
+    const plain = try tmuxStoredSessionName(allocator, "(app) - x");
+    defer allocator.free(plain);
+    try testing.expectEqualStrings("(app) - x", plain);
+
+    const empty = try tmuxStoredSessionName(allocator, "");
+    defer allocator.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 /// Asserts that `args` contains `-e` immediately followed by

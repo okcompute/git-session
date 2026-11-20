@@ -1271,24 +1271,40 @@ fn runFixNonInteractive(
     const tmux_name = try multiplexer.sessionName(allocator, session_name, branch_for_name, selected.name);
     defer allocator.free(tmux_name);
 
-    if (replace and multiplexer.sessionExists(allocator, io, tmux_name)) {
-        if (multiplexer.isCurrentSession(allocator, io, env, tmux_name)) |is_current| {
-            if (is_current) {
-                term.eprint(io, "Error: cannot replace the session git-session is running in ('{s}').\n", .{tmux_name});
+    if (replace) {
+        // Target the name the backend actually stores: tmux rewrites `.`
+        // and `:` to `_`, so the computed name would never match (and
+        // `kill-session` would reject it as a malformed target).
+        const existing_name = try multiplexer.storedSessionName(allocator, tmux_name);
+        defer allocator.free(existing_name);
+
+        if (multiplexer.sessionExists(allocator, io, existing_name)) {
+            if (multiplexer.isCurrentSession(allocator, io, env, existing_name)) |is_current| {
+                if (is_current) {
+                    term.eprint(io, "Error: cannot replace the session git-session is running in ('{s}').\n", .{existing_name});
+                    std.process.exit(1);
+                }
+            } else {
+                term.eprint(io, "Error: could not determine the current {s} session; refusing to replace '{s}'.\n", .{ multiplexer.displayName(), existing_name });
                 std.process.exit(1);
             }
-        } else {
-            term.eprint(io, "Error: could not determine the current {s} session; refusing to replace '{s}'.\n", .{ multiplexer.displayName(), tmux_name });
-            std.process.exit(1);
-        }
 
-        term.print(io, "Replacing {s} session '{s}'...\n", .{ multiplexer.displayName(), tmux_name });
-        multiplexer.stopPanes(allocator, io, env, tmux_name);
-        multiplexer.waitForPanesToExit(allocator, io, env, tmux_name);
-        multiplexer.killSession(allocator, io, tmux_name) catch |err| {
-            term.eprint(io, "Error: failed to close the existing {s} session.\n", .{multiplexer.displayName()});
-            std.process.exit(exitCodeFor(err));
-        };
+            term.print(io, "Replacing {s} session '{s}'...\n", .{ multiplexer.displayName(), existing_name });
+            multiplexer.stopPanes(allocator, io, env, existing_name);
+            multiplexer.waitForPanesToExit(allocator, io, env, existing_name);
+            multiplexer.killSession(allocator, io, existing_name) catch |err| {
+                term.eprint(io, "Error: failed to close the existing {s} session.\n", .{multiplexer.displayName()});
+                std.process.exit(exitCodeFor(err));
+            };
+
+            // tmux's `kill-session` exit status is discarded, so a kill that
+            // did not take effect would otherwise be reported as a
+            // successful replacement that never happened.
+            if (multiplexer.sessionExists(allocator, io, existing_name)) {
+                term.eprint(io, "Error: the existing {s} session could not be closed.\n", .{multiplexer.displayName()});
+                std.process.exit(1);
+            }
+        }
     }
 
     term.print(io, "Recreating {s} session for '{s}'...\n", .{ multiplexer.displayName(), session_name });
