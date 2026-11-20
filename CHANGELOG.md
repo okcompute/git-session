@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `--replace` flag for `git-session fix` (requires `--session`) to close an existing tmux or Rex session—stopping running programs cleanly first—and recreate it with its configured windows and `fix_command`s. Refuses to run when git-session is running inside the session being replaced.
+- `--multiplexer <rex|tmux>` global flag to select the terminal multiplexer for a single run, overriding `multiplexer` in `config.toml` and `REX_SESSION`/`TMUX` detection.
+
 ## [1.2.0] - 2026-11-07
 
 ### Added

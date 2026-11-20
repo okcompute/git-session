@@ -7,10 +7,10 @@ git-session can be driven entirely from the command line. When enough informatio
 ```
 git-session [--version | -v]
 git-session [help | --help | -h]
-git-session [--repository <name>]
+git-session [--repository <name>] [--multiplexer <rex|tmux>]
 git-session create  --repository <name> [--session <name>] [--branch <name>] [--prefix <name>]
 git-session remove  --repository <name> [--session <name>]
-git-session fix     --repository <name> [--session <name>]
+git-session fix     --repository <name> [--session <name>] [--replace]
 git-session add-repo    <url> [--root <path>] [--name <name>] [--branch <name>] [--prefix <list>] [--yes | -y]
 git-session remove-repo <name> [--yes | -y]
 git-session config
@@ -25,10 +25,11 @@ git-session config remove-root [<path>] [--yes | -y]
 | `--version`, `-v` | Print the version and exit. |
 | `help`, `--help`, `-h` | Print usage and exit. |
 | `--repository <name>` | (TUI mode) Pre-select a repository and open the TUI at its action menu. |
+| `--multiplexer <rex\|tmux>` | Use this multiplexer for this run, overriding `multiplexer` in `config.toml` and `REX_SESSION`/`TMUX` detection. Accepted anywhere on the command line. Ignored by `config`, `config add-root`, and `add-repo`. |
 
 ## Terminal multiplexer
 
-Sessions run in tmux by default, or in [Rex](https://www.superlogical.com/rex/docs.md) when `multiplexer = "rex"` is set in `~/.config/git-session/config.toml` (or when git-session runs in a Rex terminal outside tmux and the key is not set). There is no command-line flag for it. Below, "tmux session" means "Rex session" when Rex is selected. See [Terminal multiplexer](configuration.md#terminal-multiplexer) for how the backend is chosen and what Rex requires.
+Sessions run in tmux by default, or in [Rex](https://www.superlogical.com/rex/docs.md) when `--multiplexer rex` is passed, when `multiplexer = "rex"` is set in `~/.config/git-session/config.toml`, or when git-session runs in a Rex terminal outside tmux and neither is set. Below, "tmux session" means "Rex session" when Rex is selected. See [Terminal multiplexer](configuration.md#terminal-multiplexer) for how the backend is chosen and what Rex requires.
 
 ## Session subcommands
 
@@ -112,22 +113,31 @@ git-session remove --repository my-project
 
 ### `fix`
 
-Recreate the tmux (or Rex) session for an existing worktree (useful after a reboot or when the tmux server was restarted). When the session still exists it is left as is and you are offered to attach to it (or show it in Rex). Windows run their `fix_command` instead of `command` when one is configured (see [Different commands on `fix`](configuration.md#different-commands-on-fix)).
+Recreate the tmux (or Rex) session for an existing worktree (useful after a reboot or when the tmux server was restarted). When the session still exists it is left as is and you are offered to attach to it (or show it in Rex), unless `--replace` is passed. Windows run their `fix_command` instead of `command` when one is configured (see [Different commands on `fix`](configuration.md#different-commands-on-fix)).
 
 ```
-git-session fix --repository <name> [--session <name>]
+git-session fix --repository <name> [--session <name>] [--replace]
 ```
 
 | Flag | Description |
 |---|---|
 | `--repository <name>` | **Required.** Repository name. |
 | `--session <name>` | Session (worktree) name to fix. When omitted the TUI opens at the session-selection screen. |
+| `--replace` | Close the existing session (if any) and recreate it from scratch. Running programs are asked to exit cleanly before the session is closed. Requires `--session`. |
+
+When `--replace` is passed from inside the session being replaced, git-session refuses to close it (which would terminate git-session before creating the new session) and exits with code 1.
 
 **Examples:**
 
 ```bash
 # Non-interactive fix
 git-session fix --repository my-project --session login-page
+
+# Replace an existing session (e.g. after a Rex server restart)
+git-session fix --repository my-project --session login-page --replace
+
+# Replace in Rex from a script with no terminal
+git-session fix --repository my-project --session login-page --replace --multiplexer rex </dev/null
 
 # Open TUI at the session list for my-project
 git-session fix --repository my-project
@@ -280,6 +290,10 @@ The last remaining root cannot be removed.
 | `add-repo` clone failed | Prints an error, removes the partially-created directory, exits with code 1. |
 | Partial information provided (create / remove / fix) | Opens the TUI at the step where input is needed. |
 | Unknown `multiplexer` value in `config.toml` | Prints an error naming the value, exits with code 1. |
+| `--multiplexer` missing value or invalid value | Prints an error (`--multiplexer requires a value` or `--multiplexer must be "tmux" or "rex"`), exits with code 1. |
+| `--replace` used with `create` or `remove` | Prints `Error: --replace is only valid with 'fix'` and usage, exits with code 1. |
+| `--replace` used without `--session` | Prints `Error: --replace requires --session` and usage, exits with code 1. |
+| `fix --replace` run from inside the session being replaced | Prints `Error: cannot replace the session git-session is running in ('<name>').` and exits with code 1 without touching the session. |
 | Rex selected but the `rex` CLI is not on `PATH` or in `$REX_BIN_DIR` | Prints an error explaining how to make it available, exits with code 1. |
 | Rex selected but the Rex server is not running (the app is not open) | Prints `the Rex server is not running`, exits with code 4. Applies to the TUI, `create`, `remove`, `fix`, and `remove-repo`, and nothing is changed on disk. |
 | Showing the session in Rex fails (Remote Control off) | Prints a hint; the session itself was created successfully (exit code 0). |

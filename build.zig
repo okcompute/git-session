@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
     // ---------------------------------------------------------------------------
     // Each source module with `test` blocks gets its own test compilation.
     const test_modules = [_][]const u8{
+        "src/cli_args.zig",
         "src/config.zig",
         "src/git.zig",
         "src/git_branch_validate.zig",

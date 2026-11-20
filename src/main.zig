@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const term = @import("term.zig");
 const config = @import("config.zig");
 const cli = @import("cli.zig");
+const cli_args = @import("cli_args.zig");
 const tui = @import("tui.zig");
 const mux = @import("mux.zig");
 
@@ -30,7 +31,25 @@ pub fn main(init: std.process.Init) !void {
     defer app_arena.deinit();
     const app_alloc = app_arena.allocator();
 
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const raw_args = try init.minimal.args.toSlice(init.arena.allocator());
+
+    // Strip the global `--multiplexer <rex|tmux>` flag before any subcommand
+    // or flag parsing so it works in any position and is validated with a
+    // flag-specific error message rather than blaming config.toml.
+    const extracted = cli_args.extractMultiplexerFlag(init.arena.allocator(), raw_args) catch |err| switch (err) {
+        error.MissingMultiplexerValue => {
+            term.eprint(io, "Error: --multiplexer requires a value\n\n", .{});
+            cli.printUsage(io);
+            std.process.exit(1);
+        },
+        error.InvalidMultiplexerValue => {
+            term.eprint(io, "Error: --multiplexer must be \"tmux\" or \"rex\"\n", .{});
+            std.process.exit(1);
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    const args = extracted.remaining;
+    const multiplexer_override = extracted.multiplexer;
 
     // ── Flags that do not require config ────────────────────────────────────
 
@@ -49,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
 
         // `config` loads its own app config internally.
         if (std.mem.eql(u8, cmd, "config")) {
-            try cli.handleConfigCommand(app_alloc, io, env, args);
+            try cli.handleConfigCommand(app_alloc, io, env, args, multiplexer_override);
             return;
         }
     }
@@ -137,7 +156,7 @@ pub fn main(init: std.process.Init) !void {
     // with a clear message when the configured backend is unusable (status
     // 4 when the Rex server is not running).
 
-    const multiplexer = mux.Mux.initOrExit(app_alloc, io, env, app_config.multiplexer);
+    const multiplexer = mux.Mux.initOrExit(app_alloc, io, env, multiplexer_override orelse app_config.multiplexer);
     defer multiplexer.deinit(app_alloc);
     multiplexer.ensureReadyOrExit(app_alloc, io);
 
@@ -185,49 +204,29 @@ pub fn main(init: std.process.Init) !void {
             std.mem.eql(u8, cmd, "remove") or
             std.mem.eql(u8, cmd, "fix"))
         {
-            var parsed = cli.CliArgs{ .operation = operationFromString(cmd) };
-
-            var i: usize = 2;
-            while (i < args.len) : (i += 1) {
-                const arg = args[i];
-                if (std.mem.eql(u8, arg, "--repository")) {
-                    i += 1;
-                    if (i >= args.len) {
-                        term.eprint(io, "Error: --repository requires a value\n\n", .{});
-                        cli.printUsage(io);
-                        std.process.exit(1);
-                    }
-                    parsed.repository = args[i];
-                } else if (std.mem.eql(u8, arg, "--session")) {
-                    i += 1;
-                    if (i >= args.len) {
-                        term.eprint(io, "Error: --session requires a value\n\n", .{});
-                        cli.printUsage(io);
-                        std.process.exit(1);
-                    }
-                    parsed.session = args[i];
-                } else if (std.mem.eql(u8, arg, "--branch")) {
-                    i += 1;
-                    if (i >= args.len) {
-                        term.eprint(io, "Error: --branch requires a value\n\n", .{});
-                        cli.printUsage(io);
-                        std.process.exit(1);
-                    }
-                    parsed.branch = args[i];
-                } else if (std.mem.eql(u8, arg, "--prefix")) {
-                    i += 1;
-                    if (i >= args.len) {
-                        term.eprint(io, "Error: --prefix requires a value\n\n", .{});
-                        cli.printUsage(io);
-                        std.process.exit(1);
-                    }
-                    parsed.prefix = args[i];
-                } else {
-                    term.eprint(io, "Unknown flag: {s}\n\n", .{arg});
+            const parsed = switch (cli_args.parseSessionArgs(operationFromString(cmd), args[2..])) {
+                .ok => |p| p,
+                .missing_value => |flag| {
+                    term.eprint(io, "Error: {s} requires a value\n\n", .{flag});
                     cli.printUsage(io);
                     std.process.exit(1);
-                }
-            }
+                },
+                .unknown_flag => |flag| {
+                    term.eprint(io, "Unknown flag: {s}\n\n", .{flag});
+                    cli.printUsage(io);
+                    std.process.exit(1);
+                },
+                .replace_not_fix => {
+                    term.eprint(io, "Error: --replace is only valid with 'fix'\n\n", .{});
+                    cli.printUsage(io);
+                    std.process.exit(1);
+                },
+                .replace_requires_session => {
+                    term.eprint(io, "Error: --replace requires --session\n\n", .{});
+                    cli.printUsage(io);
+                    std.process.exit(1);
+                },
+            };
 
             // Dispatch to the appropriate handler. The handler returns `null`
             // when the operation finished non-interactively, or a populated

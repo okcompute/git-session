@@ -211,11 +211,19 @@ pub fn tmuxAttachOrSwitch(allocator: std.mem.Allocator, io: std.Io, env: *const 
 
 /// Returns the name of the current tmux session, or `null` if the
 /// process is not running inside tmux or the name cannot be determined.
+/// Targets `$TMUX_PANE` when set so the result always reflects the session
+/// owning this process's pane rather than whatever session an attached
+/// client is viewing.
 /// The returned slice is heap-allocated; the caller must free it with
 /// `allocator.free`.
 pub fn tmuxGetCurrentSession(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ?[]const u8 {
     if (!isInsideTmux(env)) return null;
-    const r = process.exec(allocator, io, &.{ "tmux", "display-message", "-p", "#S" }, null) catch return null;
+    const pane = env.get("TMUX_PANE");
+    const argv: []const []const u8 = if (pane != null and pane.?.len > 0)
+        &.{ "tmux", "display-message", "-t", pane.?, "-p", "#S" }
+    else
+        &.{ "tmux", "display-message", "-p", "#S" };
+    const r = process.exec(allocator, io, argv, null) catch return null;
     defer allocator.free(r.stderr_data);
     if (!r.exited_ok) {
         allocator.free(r.stdout_data);
