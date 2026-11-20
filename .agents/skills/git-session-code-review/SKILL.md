@@ -188,6 +188,12 @@ This codebase uses Zig's built-in `test` blocks, co-located at the
 bottom of each source file. When reviewing changes, apply these
 guidelines:
 
+- **New test modules must be registered in `build.zig`.** `zig build test`
+  only compiles the files listed in the `test_modules` array, so a `test`
+  block added to any other file — including `main.zig` and `cli.zig` — is
+  never compiled or run, and the build still reports success. Flag any
+  new `src/*.zig` file with tests that is missing from that list.
+
 ### What should be tested
 
 - **Pure functions and parsing logic** — always. If a new function
@@ -212,7 +218,10 @@ guidelines:
   (like deriving names from URLs) is testable and should be tested, but
   the subprocess invocation itself is not.
 - **`main.zig`** — entry point glue code.
-- **`cli.zig`** — CLI dispatch that delegates to other modules.
+- **`cli.zig`** — CLI dispatch that delegates to other modules. Flag flag
+  parsing and other decision logic added here or in `main.zig` and suggest
+  moving it into a pure, tested module instead (e.g. `cli_args.zig`), which
+  is how the session subcommand flags are parsed.
 - **`build.zig`** — build configuration. Review for correctness of
   dependencies, steps, and flags, but tests and doc comments are not
   required.
@@ -234,9 +243,9 @@ guidelines:
 ### When to flag missing tests
 
 If a PR adds a new pure function or parsing logic to a module that
-already has tests (config.zig, git.zig, tmux.zig, term.zig, repo.zig,
-process.zig, usage.zig), and the function is not tested, flag it. Frame
-it as a suggestion, not a blocker — something like:
+already has tests (cli_args.zig, config.zig, git.zig, tmux.zig, term.zig,
+repo.zig, process.zig, usage.zig), and the function is not tested, flag
+it. Frame it as a suggestion, not a blocker — something like:
 
 > "Consider adding a test for `newFunctionName` — the existing tests in
 > this module cover similar logic and this function has testable edge
@@ -282,6 +291,11 @@ analysis. Configuration is in `zlint.json` at the repository root.
 - As part of every review, run `zlint` from the repo root and verify it
   reports **zero errors and zero warnings**. If it doesn't, flag the
   issues.
+- CI runs `zlint`, `zig build`, `zig build test`, and a ReleaseSafe build;
+  it does **not** run `zig fmt`. `zig fmt --check src/` already reports
+  pre-existing failures (e.g. `src/cli.zig`, `src/rex.zig`,
+  `src/repo.zig`), so compare against the base commit before flagging
+  formatting or reformatting files the change did not touch.
 - `// zlint-disable` file-level directives must **not** be used — they
   trigger a known zlint bug (hang/OOM). If a change introduces one,
   flag it and suggest disabling the rule in `zlint.json` instead.
