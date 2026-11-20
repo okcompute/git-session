@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
     // ---------------------------------------------------------------------------
     // Each source module with `test` blocks gets its own test compilation.
     const test_modules = [_][]const u8{
+        "src/cli.zig",
         "src/cli_args.zig",
         "src/config.zig",
         "src/git.zig",
@@ -64,12 +65,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
 
     for (test_modules) |src| {
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path(src),
+            .target = target,
+            .optimize = optimize,
+        });
+        // A module under test can reach `main.zig` (which needs the
+        // generated version option) and `tui.zig` (which needs vaxis), so
+        // both are wired up for every test root.
+        test_mod.addOptions("build_options", options);
+        test_mod.addImport("vaxis", vaxis.module("vaxis"));
+
         const unit_tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(src),
-                .target = target,
-                .optimize = optimize,
-            }),
+            .root_module = test_mod,
         });
 
         const run_unit_tests = b.addRunArtifact(unit_tests);
