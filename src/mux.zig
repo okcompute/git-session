@@ -72,7 +72,7 @@ pub const Mux = union(Kind) {
                     "Error: the `rex` command was not found on PATH or in $REX_BIN_DIR.\n" ++
                         "Rex (macOS app, public beta) only puts `rex` on PATH in its own terminals.\n" ++
                         "Run git-session from a Rex terminal, or link the CLI shipped in the Rex app into a directory on your PATH.\n" ++
-                        "To use tmux instead, set multiplexer = \"tmux\" in ~/.config/git-session/config.toml.\n",
+                        "To use tmux instead, pass --multiplexer tmux or set multiplexer = \"tmux\" in ~/.config/git-session/config.toml.\n",
                     .{},
                 ),
                 else => term.eprint(io, "Error: could not set up the terminal multiplexer: {any}\n", .{err}),
@@ -121,6 +121,19 @@ pub const Mux = union(Kind) {
         return switch (self) {
             .tmux => tmux.tmuxSessionExists(allocator, io, name),
             .rex => |r| r.sessionExists(allocator, io, name),
+        };
+    }
+
+    /// Returns the name the backend stores for the session git-session
+    /// would name `name`. tmux rewrites `.` and `:` to `_`, so an existing
+    /// session has to be targeted by the rewritten name; Rex stores labels
+    /// verbatim.
+    /// The returned slice is heap-allocated; the caller must free it with
+    /// `allocator.free`.
+    pub fn storedSessionName(self: Mux, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+        return switch (self) {
+            .tmux => tmux.tmuxStoredSessionName(allocator, name),
+            .rex => allocator.dupe(u8, name),
         };
     }
 
@@ -198,6 +211,30 @@ pub const Mux = union(Kind) {
         return switch (self) {
             .tmux => tmux.isInsideTmux(env),
             .rex => env.get("REX_SESSION") != null,
+        };
+    }
+
+    /// Returns whether git-session is running inside the session named `name`:
+    /// - `false` when not inside this multiplexer, or inside a different session.
+    /// - `true` when running inside `name`.
+    /// - `null` when inside this multiplexer (`TMUX` or non-empty `REX_SESSION`
+    ///   is set) but the current session cannot be determined.
+    pub fn isCurrentSession(self: Mux, allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, name: []const u8) ?bool {
+        return switch (self) {
+            .tmux => {
+                if (!tmux.isInsideTmux(env)) return false;
+                const current = tmux.tmuxGetCurrentSession(allocator, io, env) orelse return null;
+                defer allocator.free(current);
+                return tmux.sessionNameMatches(current, name);
+            },
+            .rex => |r| {
+                // Check before spawning `rex ls` so callers outside Rex avoid a subprocess.
+                const current = env.get("REX_SESSION") orelse return false;
+                if (current.len == 0) return false;
+                const sessions = r.listSessions(allocator, io) catch return null;
+                defer rex.freeSessions(allocator, sessions);
+                return rex.isCurrentSession(sessions, current, name);
+            },
         };
     }
 
@@ -432,6 +469,8 @@ test "chooseKind ignores an empty REX_SESSION" {
 test "chooseKind: explicit config beats detection" {
     try testing.expectEqual(Kind.tmux, try chooseKind("tmux", "session:abc", null));
     try testing.expectEqual(Kind.rex, try chooseKind("rex", null, "/tmp/tmux-501/default,1,0"));
+    try testing.expectEqual(Kind.rex, try chooseKind("rex", null, null));
+    try testing.expectEqual(Kind.rex, try chooseKind("rex", "session:abc", "/tmp/tmux-501/default,1,0"));
 }
 
 test "chooseKind rejects an unknown configured value" {
@@ -557,4 +596,48 @@ test "Mux.isInside checks the backend's own environment variable" {
     try env.put("REX_SESSION", "session:abc");
     try testing.expect(r.isInside(&env));
     try testing.expect(!t.isInside(&env));
+}
+
+test "rex.isCurrentSession matches REX_SESSION across duplicate labels" {
+    const allocator = testing.allocator;
+    const sessions = try ownedRexSessions(allocator, &.{ "app · login", "app · other", "app · login" });
+    defer rex.freeSessions(allocator, sessions);
+
+    // ownedRexSessions assigns IDs "session:0", "session:1", and "session:2".
+    try testing.expect(rex.isCurrentSession(sessions, "session:0", "app · login"));
+    try testing.expect(rex.isCurrentSession(sessions, "session:2", "app · login"));
+    try testing.expect(!rex.isCurrentSession(sessions, "session:1", "app · login"));
+    try testing.expect(!rex.isCurrentSession(sessions, "session:99", "app · login"));
+}
+
+test "Mux.storedSessionName folds for tmux and copies for Rex" {
+    const allocator = testing.allocator;
+
+    const t: Mux = .tmux;
+    const folded = try t.storedSessionName(allocator, "(my.app) - x");
+    defer allocator.free(folded);
+    try testing.expectEqualStrings("(my_app) - x", folded);
+
+    const r: Mux = .{ .rex = .{ .bin = "rex" } };
+    const label = try r.storedSessionName(allocator, "app · wt");
+    defer allocator.free(label);
+    try testing.expectEqualStrings("app · wt", label);
+    // Rex labels are copied, not aliased, so the caller can free freely.
+    try testing.expect(label.ptr != "app · wt".ptr);
+}
+
+test "Mux.isCurrentSession distinguishes outside from lookup failure" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+
+    const t: Mux = .tmux;
+    const r: Mux = .{ .rex = .{ .bin = "/nonexistent/rex" } };
+    try testing.expectEqual(@as(?bool, false), t.isCurrentSession(testing.allocator, testing.io, &env, "(app) - wt"));
+    try testing.expectEqual(@as(?bool, false), r.isCurrentSession(testing.allocator, testing.io, &env, "app · wt"));
+
+    try env.put("REX_SESSION", "");
+    try testing.expectEqual(@as(?bool, false), r.isCurrentSession(testing.allocator, testing.io, &env, "app · wt"));
+
+    try env.put("REX_SESSION", "session:abc");
+    try testing.expectEqual(@as(?bool, null), r.isCurrentSession(testing.allocator, testing.io, &env, "app · wt"));
 }

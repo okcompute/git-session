@@ -211,11 +211,19 @@ pub fn tmuxAttachOrSwitch(allocator: std.mem.Allocator, io: std.Io, env: *const 
 
 /// Returns the name of the current tmux session, or `null` if the
 /// process is not running inside tmux or the name cannot be determined.
+/// Targets `$TMUX_PANE` when set so the result always reflects the session
+/// owning this process's pane rather than whatever session an attached
+/// client is viewing.
 /// The returned slice is heap-allocated; the caller must free it with
 /// `allocator.free`.
 pub fn tmuxGetCurrentSession(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ?[]const u8 {
     if (!isInsideTmux(env)) return null;
-    const r = process.exec(allocator, io, &.{ "tmux", "display-message", "-p", "#S" }, null) catch return null;
+    const pane = env.get("TMUX_PANE");
+    const argv: []const []const u8 = if (pane != null and pane.?.len > 0)
+        &.{ "tmux", "display-message", "-t", pane.?, "-p", "#S" }
+    else
+        &.{ "tmux", "display-message", "-p", "#S" };
+    const r = process.exec(allocator, io, argv, null) catch return null;
     defer allocator.free(r.stderr_data);
     if (!r.exited_ok) {
         allocator.free(r.stdout_data);
@@ -288,6 +296,21 @@ pub fn sessionNameMatches(listed: []const u8, computed: []const u8) bool {
 /// Maps the characters tmux rewrites in session names (`.`, `:`) to `_`.
 fn foldSessionChar(c: u8) u8 {
     return if (c == '.' or c == ':') '_' else c;
+}
+
+/// Returns the name tmux stores for a session created as `computed`.
+///
+/// tmux rewrites `.` and `:` to `_` in session names, and it parses a `.`
+/// in a `-t` target as a window/pane separator, so commands like
+/// `has-session` and `kill-session` must be given the rewritten name or
+/// they fail with "can't find pane" on a repo or worktree containing
+/// those characters.
+/// The returned slice is heap-allocated; the caller must free it with
+/// `allocator.free`.
+pub fn tmuxStoredSessionName(allocator: std.mem.Allocator, computed: []const u8) ![]u8 {
+    const stored = try allocator.alloc(u8, computed.len);
+    for (computed, 0..) |c, i| stored[i] = foldSessionChar(c);
+    return stored;
 }
 
 /// Returns `true` when a tmux client is currently attached to the given
@@ -542,6 +565,26 @@ test "sessionNameMatches folds the characters tmux rewrites" {
     try testing.expect(sessionNameMatches("(app) - x", "(app) - x"));
     try testing.expect(!sessionNameMatches("(app) - x", "(app) - y"));
     try testing.expect(!sessionNameMatches("(app) - x", "(app) - xx"));
+}
+
+test "tmuxStoredSessionName rewrites the characters tmux folds" {
+    const allocator = testing.allocator;
+
+    const dotted = try tmuxStoredSessionName(allocator, "(my.app) - x");
+    defer allocator.free(dotted);
+    try testing.expectEqualStrings("(my_app) - x", dotted);
+
+    const colon = try tmuxStoredSessionName(allocator, "(app) - a:b");
+    defer allocator.free(colon);
+    try testing.expectEqualStrings("(app) - a_b", colon);
+
+    const plain = try tmuxStoredSessionName(allocator, "(app) - x");
+    defer allocator.free(plain);
+    try testing.expectEqualStrings("(app) - x", plain);
+
+    const empty = try tmuxStoredSessionName(allocator, "");
+    defer allocator.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 /// Asserts that `args` contains `-e` immediately followed by

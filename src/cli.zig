@@ -24,8 +24,9 @@ pub fn printUsage(io: std.Io) void {
         \\Usage: git-session [options] [command]
         \\
         \\Options:
-        \\  --repository <name>  Pre-select a repository and open the TUI at its menu
-        \\  --version, -v        Show version
+        \\  --repository <name>       Pre-select a repository and open the TUI at its menu
+        \\  --multiplexer <rex|tmux>  Use this multiplexer instead of the configured or detected one
+        \\  --version, -v             Show version
         \\
         \\Commands:
         \\  (none)              Interactive session manager (TUI)
@@ -44,6 +45,7 @@ pub fn printUsage(io: std.Io) void {
         \\  --session <name>     Session name (create/remove/fix)
         \\  --branch <name>      Base branch for the new session (create only)
         \\  --prefix <name>      Branch prefix, e.g. "feature" (create only)
+        \\  --replace            Close the existing session and recreate it (fix only)
         \\
         \\add-repo accepts:
         \\  <url>                Clone URL (positional, required)
@@ -68,13 +70,16 @@ pub fn printUsage(io: std.Io) void {
 /// Dispatches `config` sub-commands.
 ///
 /// `args` is the full process argument list (including `argv[0]`).
+/// `multiplexer_override` is the value from `--multiplexer`, forwarded only to
+/// `config remove-root` when cascading session removal (`config` itself always
+/// displays the value from `config.toml`).
 /// Behaviour depends on the sub-command at `args[2]`:
 ///   - (none)        — displays the current root folders.
 ///   - `add-root`    — adds a new root (from `args[3]` or interactive prompt).
 ///   - `remove-root` — removes an existing root (from `args[3]` or interactive picker).
 ///
 /// Calls `std.process.exit(1)` on unrecognised sub-commands.
-pub fn handleConfigCommand(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
+pub fn handleConfigCommand(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, args: []const []const u8, multiplexer_override: ?[]const u8) !void {
     if (args.len == 2) {
         // git-session config  ->  show current config
         var cfg = config.loadAppConfig(allocator, io, env) catch {
@@ -179,7 +184,7 @@ pub fn handleConfigCommand(allocator: std.mem.Allocator, io: std.Io, env: *const
             break :blk term.pickFromList(io, cfg.roots.items, "Select root to remove: ") orelse return;
         };
 
-        try removeRootAndOptionallyContents(allocator, io, env, &cfg, idx, assume_yes);
+        try removeRootAndOptionallyContents(allocator, io, env, &cfg, idx, assume_yes, multiplexer_override);
         return;
     }
 
@@ -300,6 +305,8 @@ fn classifyRootDiskState(outcome: RootDiskOutcome) RootDiskState {
     };
 }
 
+/// Unhooks the root at `cfg.roots.items[idx]` and optionally deletes every
+/// repository registered under it along with its multiplexer sessions.
 fn removeRootAndOptionallyContents(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -307,6 +314,7 @@ fn removeRootAndOptionallyContents(
     cfg: *config.AppConfig,
     idx: usize,
     assume_yes: bool,
+    multiplexer_override: ?[]const u8,
 ) !void {
     const root = cfg.roots.items[idx];
 
@@ -328,7 +336,8 @@ fn removeRootAndOptionallyContents(
     // `config` runs before main selects the multiplexer. The backend itself
     // is only set up once the user confirms deleting repositories, so that
     // an unusable backend never blocks merely unhooking the root.
-    const kind_name = if (mux.chooseKind(cfg.multiplexer, env.get("REX_SESSION"), env.get("TMUX"))) |k|
+    const configured_multiplexer = multiplexer_override orelse cfg.multiplexer;
+    const kind_name = if (mux.chooseKind(configured_multiplexer, env.get("REX_SESSION"), env.get("TMUX"))) |k|
         k.displayName()
     else |_|
         "terminal";
@@ -355,7 +364,7 @@ fn removeRootAndOptionallyContents(
     }
 
     if (should_delete_repos) {
-        multiplexer = mux.Mux.initOrExit(allocator, io, env, cfg.multiplexer);
+        multiplexer = mux.Mux.initOrExit(allocator, io, env, configured_multiplexer);
         multiplexer.?.ensureReadyOrExit(allocator, io);
         for (entries.items) |entry| {
             const repo_root = std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.root, entry.name }) catch {
@@ -665,7 +674,7 @@ pub fn handleFixCommand(
         var selected = (try repo.openRepo(allocator, io, env, entry.root, entry.name)) orelse std.process.exit(1);
         defer repo.freeSelectedRepo(allocator, &selected);
 
-        try runFixNonInteractive(allocator, io, env, multiplexer, selected, session_name);
+        try runFixNonInteractive(allocator, io, env, multiplexer, selected, session_name, cli_args.replace);
         return null;
     }
 
@@ -1187,8 +1196,10 @@ pub fn removeRepositoryFully(
 
 /// Runs the full session-fix flow without TUI interaction.
 ///
-/// Recreates the tmux session for an existing worktree and offers to
-/// attach when running inside tmux.
+/// Recreates the tmux (or Rex) session for an existing worktree and offers
+/// to attach (or show it in Rex). When `replace` is true and the session
+/// already exists, stops its panes cleanly and closes it before recreating
+/// it; refuses if git-session is running inside that session.
 fn runFixNonInteractive(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1196,6 +1207,7 @@ fn runFixNonInteractive(
     multiplexer: mux.Mux,
     selected: repo.SelectedRepo,
     session_name: []const u8,
+    replace: bool,
 ) !void {
     // Verify the session worktree exists.
     var worktrees = try repo.listWorktrees(allocator, io, selected.root);
@@ -1258,6 +1270,42 @@ fn runFixNonInteractive(
 
     const tmux_name = try multiplexer.sessionName(allocator, session_name, branch_for_name, selected.name);
     defer allocator.free(tmux_name);
+
+    if (replace) {
+        // Target the name the backend actually stores: tmux rewrites `.`
+        // and `:` to `_`, so the computed name would never match (and
+        // `kill-session` would reject it as a malformed target).
+        const existing_name = try multiplexer.storedSessionName(allocator, tmux_name);
+        defer allocator.free(existing_name);
+
+        if (multiplexer.sessionExists(allocator, io, existing_name)) {
+            if (multiplexer.isCurrentSession(allocator, io, env, existing_name)) |is_current| {
+                if (is_current) {
+                    term.eprint(io, "Error: cannot replace the session git-session is running in ('{s}').\n", .{existing_name});
+                    std.process.exit(1);
+                }
+            } else {
+                term.eprint(io, "Error: could not determine the current {s} session; refusing to replace '{s}'.\n", .{ multiplexer.displayName(), existing_name });
+                std.process.exit(1);
+            }
+
+            term.print(io, "Replacing {s} session '{s}'...\n", .{ multiplexer.displayName(), existing_name });
+            multiplexer.stopPanes(allocator, io, env, existing_name);
+            multiplexer.waitForPanesToExit(allocator, io, env, existing_name);
+            multiplexer.killSession(allocator, io, existing_name) catch |err| {
+                term.eprint(io, "Error: failed to close the existing {s} session.\n", .{multiplexer.displayName()});
+                std.process.exit(exitCodeFor(err));
+            };
+
+            // tmux's `kill-session` exit status is discarded, so a kill that
+            // did not take effect would otherwise be reported as a
+            // successful replacement that never happened.
+            if (multiplexer.sessionExists(allocator, io, existing_name)) {
+                term.eprint(io, "Error: the existing {s} session could not be closed.\n", .{multiplexer.displayName()});
+                std.process.exit(1);
+            }
+        }
+    }
 
     term.print(io, "Recreating {s} session for '{s}'...\n", .{ multiplexer.displayName(), session_name });
     multiplexer.createSession(allocator, io, env, tmux_name, wt_path, selected.config.windows.items, .fix) catch |err| {
