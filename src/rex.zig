@@ -654,8 +654,10 @@ pub const Rex = struct {
     ///
     /// Unlike tmux, Rex does not report which session the app is showing
     /// and has no "last session" action, so this keys off REX_BLOCK and
-    /// uses "Next Session". Best-effort: failures (e.g. Remote Control
-    /// off) are ignored.
+    /// uses "Next Session". Best-effort: failures (Remote Control off,
+    /// `rex ls` or any `rex block ls` lookup erroring out, etc.) are
+    /// ignored, which may leave the user looking at the session being torn
+    /// down.
     pub fn switchAwayIfCurrent(self: Rex, allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, label: []const u8) void {
         const own_block = currentBlock(env) orelse return;
         const sessions = self.listSessions(allocator, io) catch return;
@@ -999,6 +1001,19 @@ test "containsBlock matches exact block IDs" {
     try testing.expect(!containsBlock(&.{}, "block:1"));
 }
 
+/// Writes an executable fake `rex` script inside `tmp` and returns its
+/// absolute path. Caller frees the returned path.
+fn writeFakeRex(allocator: std.mem.Allocator, tmp: *testing.TmpDir, script: []const u8) ![]u8 {
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "fake-rex",
+        .data = script,
+        .flags = .{ .permissions = .executable_file },
+    });
+    const dir_path = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(dir_path);
+    return std.fmt.allocPrint(allocator, "{s}/fake-rex", .{dir_path});
+}
+
 test "Rex.switchAwayIfCurrent switches only when REX_BLOCK is in the target session and others exist" {
     term.setQuiet(true);
     defer term.setQuiet(false);
@@ -1014,18 +1029,33 @@ test "Rex.switchAwayIfCurrent switches only when REX_BLOCK is in the target sess
 
     const script = try std.fmt.allocPrint(testing.allocator,
         \\#!/bin/sh
-        \\if [ "$2" = "ls" ]; then
+        \\while [ $# -gt 0 ]; do
+        \\  case "$1" in
+        \\    --*) shift ;;
+        \\    *) break ;;
+        \\  esac
+        \\done
+        \\if [ "$1" = "ls" ]; then
         \\  printf '{{"sessions":[{{"session_id":"session:a","label":"app · one"}},{{"session_id":"session:b","label":"app · two"}}]}}\n'
         \\  exit 0
         \\fi
-        \\if [ "$2" = "block" ] && [ "$3" = "ls" ]; then
-        \\  case "$5" in
+        \\if [ "$1" = "block" ] && [ "$2" = "ls" ]; then
+        \\  shift 2
+        \\  session=""
+        \\  while [ $# -gt 0 ]; do
+        \\    case "$1" in
+        \\      -s) session="$2"; shift 2 ;;
+        \\      *) shift ;;
+        \\    esac
+        \\  done
+        \\  case "$session" in
         \\    session:a) printf '{{"blocks":[{{"block_id":"block:a1"}}]}}\n' ;;
         \\    session:b) printf '{{"blocks":[{{"block_id":"block:b1"}}]}}\n' ;;
+        \\    *) exit 1 ;;
         \\  esac
         \\  exit 0
         \\fi
-        \\if [ "$2" = "do" ] && [ "$3" = "session.next" ]; then
+        \\if [ "$1" = "do" ] && [ "$2" = "session.next" ]; then
         \\  printf 'next\n' >> "{s}"
         \\  exit 0
         \\fi
@@ -1034,12 +1064,7 @@ test "Rex.switchAwayIfCurrent switches only when REX_BLOCK is in the target sess
     , .{log_path});
     defer testing.allocator.free(script);
 
-    try tmp.dir.writeFile(testing.io, .{
-        .sub_path = "fake-rex",
-        .data = script,
-        .flags = .{ .permissions = .executable_file },
-    });
-    const fake_bin = try std.fmt.allocPrint(testing.allocator, "{s}/fake-rex", .{dir_path});
+    const fake_bin = try writeFakeRex(testing.allocator, &tmp, script);
     defer testing.allocator.free(fake_bin);
 
     const r: Rex = .{ .bin = fake_bin };

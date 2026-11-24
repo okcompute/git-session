@@ -36,6 +36,12 @@ pub fn chooseKind(configured: ?[]const u8, rex_block_env: ?[]const u8, tmux_env:
     return .tmux;
 }
 
+/// Convenience wrapper around `chooseKind` that reads the Rex and tmux
+/// environment variables from `env`.
+pub fn chooseKindFromEnv(configured: ?[]const u8, env: *const std.process.Environ.Map) error{UnknownMultiplexer}!Kind {
+    return chooseKind(configured, env.get(rex.block_env_var), env.get("TMUX"));
+}
+
 /// A selected multiplexer backend. The `tmux` arm forwards to the
 /// functions in `tmux.zig` unchanged; the `rex` arm to `rex.zig`.
 ///
@@ -51,7 +57,7 @@ pub const Mux = union(Kind) {
     /// resolves the `rex` CLI when Rex is chosen. Call `deinit` with the
     /// same allocator.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, configured: ?[]const u8) !Mux {
-        return switch (try chooseKind(configured, env.get(rex.block_env_var), env.get("TMUX"))) {
+        return switch (try chooseKindFromEnv(configured, env)) {
             .tmux => .tmux,
             .rex => .{ .rex = .{ .bin = try rex.findBinary(allocator, io, env) } },
         };
@@ -228,7 +234,7 @@ pub const Mux = union(Kind) {
                 return tmux.sessionNameMatches(current, name);
             },
             .rex => |r| {
-                // Check before spawning `rex ls` so callers outside Rex avoid a subprocess.
+                // Skip `rex ls` and `rex block ls` subprocesses when REX_BLOCK is unset or empty.
                 const own_block = rex.currentBlock(env) orelse return false;
                 const sessions = r.listSessions(allocator, io) catch return null;
                 defer rex.freeSessions(allocator, sessions);
@@ -476,6 +482,20 @@ test "chooseKind rejects an unknown configured value" {
     try testing.expectError(error.UnknownMultiplexer, chooseKind("zellij", null, null));
 }
 
+test "chooseKindFromEnv reads REX_BLOCK and TMUX from env" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+
+    try testing.expectEqual(Kind.tmux, try chooseKindFromEnv(null, &env));
+
+    try env.put("REX_BLOCK", "block:abc");
+    try testing.expectEqual(Kind.rex, try chooseKindFromEnv(null, &env));
+
+    try env.put("TMUX", "/tmp/tmux-501/default,1,0");
+    try testing.expectEqual(Kind.tmux, try chooseKindFromEnv(null, &env));
+    try testing.expectEqual(Kind.rex, try chooseKindFromEnv("rex", &env));
+}
+
 test "Mux.init selects tmux without touching the filesystem" {
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
@@ -618,16 +638,32 @@ test "Mux.isCurrentSession matches REX_BLOCK across duplicate labels and fails s
 
     const script =
         \\#!/bin/sh
-        \\if [ "$2" = "ls" ]; then
+        \\while [ $# -gt 0 ]; do
+        \\  case "$1" in
+        \\    --*) shift ;;
+        \\    *) break ;;
+        \\  esac
+        \\done
+        \\if [ "$1" = "ls" ]; then
         \\  printf '{"sessions":[{"session_id":"session:0","label":"app · login"},{"session_id":"session:1","label":"app · other"},{"session_id":"session:2","label":"app · login"},{"session_id":"session:3","label":"app · broken"}]}\n'
         \\  exit 0
         \\fi
-        \\if [ "$2" = "block" ] && [ "$3" = "ls" ]; then
-        \\  case "$5" in
+        \\if [ "$1" = "block" ] && [ "$2" = "ls" ]; then
+        \\  shift 2
+        \\  session=""
+        \\  while [ $# -gt 0 ]; do
+        \\    case "$1" in
+        \\      -s) session="$2"; shift 2 ;;
+        \\      *) shift ;;
+        \\    esac
+        \\  done
+        \\  case "$session" in
         \\    session:0) printf '{"blocks":[{"block_id":"block:0"}]}\n' ;;
         \\    session:1) printf '{"blocks":[{"block_id":"block:1"}]}\n' ;;
         \\    session:2) printf '{"blocks":[{"block_id":"block:2"}]}\n' ;;
+        \\    # Simulates `rex block ls` failing for a matching-label session.
         \\    session:3) exit 1 ;;
+        \\    *) exit 1 ;;
         \\  esac
         \\  exit 0
         \\fi
