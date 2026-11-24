@@ -25,7 +25,7 @@ git-session config remove-root [<path>] [--yes | -y]
 | `--version`, `-v` | Print the version and exit. |
 | `help`, `--help`, `-h` | Print usage and exit. |
 | `--repository <name>` | (TUI mode) Pre-select a repository and open the TUI at its action menu. |
-| `--multiplexer <rex\|tmux>` | Use this multiplexer for this run, overriding `multiplexer` in `config.toml` and `REX_SESSION`/`TMUX` detection. Accepted anywhere on the command line. Ignored by `config`, `config add-root`, and `add-repo`; `config remove-root` honours it when it cascades into removing sessions. |
+| `--multiplexer <rex\|tmux>` | Use this multiplexer for this run, overriding `multiplexer` in `config.toml` and `REX_BLOCK`/`TMUX` detection. Accepted anywhere on the command line. Ignored by `config`, `config add-root`, and `add-repo`; `config remove-root` honours it when it cascades into removing sessions. |
 
 ## Terminal multiplexer
 

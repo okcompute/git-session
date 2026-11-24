@@ -238,6 +238,12 @@ guidelines:
   encouraged when they reduce duplication.
 - Use `testing.expectEqualStrings` for string comparisons and
   `testing.expectEqual` for other values.
+- Call `term.setQuiet(true); defer term.setQuiet(false);` in tests that
+  exercise code calling `term.print` or `term.eprint` (as in `git.zig`,
+  `repo.zig`, and `rex.zig`) — unless the test specifically verifies
+  that the code under test suppresses output itself (see
+  `src/repo.zig:1738`). Under `zig build test`, unsuppressed writes to
+  the test process's stdout can wedge the build with no error message.
 - Each test should be self-contained and not depend on other tests.
 
 ### When to flag missing tests

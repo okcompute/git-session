@@ -27,13 +27,19 @@ pub const Kind = enum {
 
 /// Picks the backend. An explicit `configured` value (the `multiplexer`
 /// key of config.toml) always wins. Without one, Rex is auto-detected
-/// when git-session runs in a Rex terminal (`REX_SESSION` set) that is
+/// when git-session runs in a Rex terminal (`REX_BLOCK` set) that is
 /// not also inside tmux (`TMUX` unset); otherwise tmux, the default.
-pub fn chooseKind(configured: ?[]const u8, rex_session_env: ?[]const u8, tmux_env: ?[]const u8) error{UnknownMultiplexer}!Kind {
+pub fn chooseKind(configured: ?[]const u8, rex_block_env: ?[]const u8, tmux_env: ?[]const u8) error{UnknownMultiplexer}!Kind {
     if (configured) |value| return Kind.parse(value) orelse error.UnknownMultiplexer;
-    const in_rex = if (rex_session_env) |v| v.len > 0 else false;
+    const in_rex = if (rex_block_env) |v| v.len > 0 else false;
     if (in_rex and tmux_env == null) return .rex;
     return .tmux;
+}
+
+/// Convenience wrapper around `chooseKind` that reads the Rex and tmux
+/// environment variables from `env`.
+pub fn chooseKindFromEnv(configured: ?[]const u8, env: *const std.process.Environ.Map) error{UnknownMultiplexer}!Kind {
+    return chooseKind(configured, env.get(rex.block_env_var), env.get("TMUX"));
 }
 
 /// A selected multiplexer backend. The `tmux` arm forwards to the
@@ -51,7 +57,7 @@ pub const Mux = union(Kind) {
     /// resolves the `rex` CLI when Rex is chosen. Call `deinit` with the
     /// same allocator.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, configured: ?[]const u8) !Mux {
-        return switch (try chooseKind(configured, env.get("REX_SESSION"), env.get("TMUX"))) {
+        return switch (try chooseKindFromEnv(configured, env)) {
             .tmux => .tmux,
             .rex => .{ .rex = .{ .bin = try rex.findBinary(allocator, io, env) } },
         };
@@ -210,14 +216,14 @@ pub const Mux = union(Kind) {
     pub fn isInside(self: Mux, env: *const std.process.Environ.Map) bool {
         return switch (self) {
             .tmux => tmux.isInsideTmux(env),
-            .rex => env.get("REX_SESSION") != null,
+            .rex => rex.currentBlock(env) != null,
         };
     }
 
     /// Returns whether git-session is running inside the session named `name`:
     /// - `false` when not inside this multiplexer, or inside a different session.
     /// - `true` when running inside `name`.
-    /// - `null` when inside this multiplexer (`TMUX` or non-empty `REX_SESSION`
+    /// - `null` when inside this multiplexer (`TMUX` or non-empty `REX_BLOCK`
     ///   is set) but the current session cannot be determined.
     pub fn isCurrentSession(self: Mux, allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, name: []const u8) ?bool {
         return switch (self) {
@@ -228,12 +234,11 @@ pub const Mux = union(Kind) {
                 return tmux.sessionNameMatches(current, name);
             },
             .rex => |r| {
-                // Check before spawning `rex ls` so callers outside Rex avoid a subprocess.
-                const current = env.get("REX_SESSION") orelse return false;
-                if (current.len == 0) return false;
+                // Skip `rex ls` and `rex block ls` subprocesses when REX_BLOCK is unset or empty.
+                const own_block = rex.currentBlock(env) orelse return false;
                 const sessions = r.listSessions(allocator, io) catch return null;
                 defer rex.freeSessions(allocator, sessions);
-                return rex.isCurrentSession(sessions, current, name);
+                return r.sessionLabelContainsBlock(allocator, io, sessions, name, own_block) catch null;
             },
         };
     }
@@ -455,26 +460,40 @@ test "chooseKind defaults to tmux" {
 }
 
 test "chooseKind auto-detects Rex inside a Rex terminal" {
-    try testing.expectEqual(Kind.rex, try chooseKind(null, "session:abc", null));
+    try testing.expectEqual(Kind.rex, try chooseKind(null, "block:abc", null));
 }
 
 test "chooseKind keeps tmux when running tmux inside a Rex terminal" {
-    try testing.expectEqual(Kind.tmux, try chooseKind(null, "session:abc", "/tmp/tmux-501/default,1,0"));
+    try testing.expectEqual(Kind.tmux, try chooseKind(null, "block:abc", "/tmp/tmux-501/default,1,0"));
 }
 
-test "chooseKind ignores an empty REX_SESSION" {
+test "chooseKind ignores an empty REX_BLOCK" {
     try testing.expectEqual(Kind.tmux, try chooseKind(null, "", null));
 }
 
 test "chooseKind: explicit config beats detection" {
-    try testing.expectEqual(Kind.tmux, try chooseKind("tmux", "session:abc", null));
+    try testing.expectEqual(Kind.tmux, try chooseKind("tmux", "block:abc", null));
     try testing.expectEqual(Kind.rex, try chooseKind("rex", null, "/tmp/tmux-501/default,1,0"));
     try testing.expectEqual(Kind.rex, try chooseKind("rex", null, null));
-    try testing.expectEqual(Kind.rex, try chooseKind("rex", "session:abc", "/tmp/tmux-501/default,1,0"));
+    try testing.expectEqual(Kind.rex, try chooseKind("rex", "block:abc", "/tmp/tmux-501/default,1,0"));
 }
 
 test "chooseKind rejects an unknown configured value" {
     try testing.expectError(error.UnknownMultiplexer, chooseKind("zellij", null, null));
+}
+
+test "chooseKindFromEnv reads REX_BLOCK and TMUX from env" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+
+    try testing.expectEqual(Kind.tmux, try chooseKindFromEnv(null, &env));
+
+    try env.put("REX_BLOCK", "block:abc");
+    try testing.expectEqual(Kind.rex, try chooseKindFromEnv(null, &env));
+
+    try env.put("TMUX", "/tmp/tmux-501/default,1,0");
+    try testing.expectEqual(Kind.tmux, try chooseKindFromEnv(null, &env));
+    try testing.expectEqual(Kind.rex, try chooseKindFromEnv("rex", &env));
 }
 
 test "Mux.init selects tmux without touching the filesystem" {
@@ -593,21 +612,88 @@ test "Mux.isInside checks the backend's own environment variable" {
     const r: Mux = .{ .rex = .{ .bin = "rex" } };
     try testing.expect(!t.isInside(&env));
     try testing.expect(!r.isInside(&env));
-    try env.put("REX_SESSION", "session:abc");
+    try env.put("REX_BLOCK", "");
+    try testing.expect(!r.isInside(&env));
+    try env.put("REX_BLOCK", "block:abc");
     try testing.expect(r.isInside(&env));
     try testing.expect(!t.isInside(&env));
 }
 
-test "rex.isCurrentSession matches REX_SESSION across duplicate labels" {
-    const allocator = testing.allocator;
-    const sessions = try ownedRexSessions(allocator, &.{ "app · login", "app · other", "app · login" });
-    defer rex.freeSessions(allocator, sessions);
+/// Writes an executable fake `rex` script inside `tmp` and returns its
+/// absolute path. Caller frees the returned path.
+fn writeFakeRex(allocator: std.mem.Allocator, tmp: *testing.TmpDir, script: []const u8) ![]u8 {
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "fake-rex",
+        .data = script,
+        .flags = .{ .permissions = .executable_file },
+    });
+    const dir_path = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(dir_path);
+    return std.fmt.allocPrint(allocator, "{s}/fake-rex", .{dir_path});
+}
 
-    // ownedRexSessions assigns IDs "session:0", "session:1", and "session:2".
-    try testing.expect(rex.isCurrentSession(sessions, "session:0", "app · login"));
-    try testing.expect(rex.isCurrentSession(sessions, "session:2", "app · login"));
-    try testing.expect(!rex.isCurrentSession(sessions, "session:1", "app · login"));
-    try testing.expect(!rex.isCurrentSession(sessions, "session:99", "app · login"));
+test "Mux.isCurrentSession matches REX_BLOCK across duplicate labels and fails safe" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\#!/bin/sh
+        \\while [ $# -gt 0 ]; do
+        \\  case "$1" in
+        \\    --*) shift ;;
+        \\    *) break ;;
+        \\  esac
+        \\done
+        \\if [ "$1" = "ls" ]; then
+        \\  printf '{"sessions":[{"session_id":"session:0","label":"app · login"},{"session_id":"session:1","label":"app · other"},{"session_id":"session:2","label":"app · login"},{"session_id":"session:3","label":"app · broken"}]}\n'
+        \\  exit 0
+        \\fi
+        \\if [ "$1" = "block" ] && [ "$2" = "ls" ]; then
+        \\  shift 2
+        \\  session=""
+        \\  while [ $# -gt 0 ]; do
+        \\    case "$1" in
+        \\      -s) session="$2"; shift 2 ;;
+        \\      *) shift ;;
+        \\    esac
+        \\  done
+        \\  case "$session" in
+        \\    session:0) printf '{"blocks":[{"block_id":"block:0"}]}\n' ;;
+        \\    session:1) printf '{"blocks":[{"block_id":"block:1"}]}\n' ;;
+        \\    session:2) printf '{"blocks":[{"block_id":"block:2"}]}\n' ;;
+        \\    # Simulates `rex block ls` failing for a matching-label session.
+        \\    session:3) exit 1 ;;
+        \\    *) exit 1 ;;
+        \\  esac
+        \\  exit 0
+        \\fi
+        \\exit 1
+        \\
+    ;
+    const fake_bin = try writeFakeRex(testing.allocator, &tmp, script);
+    defer testing.allocator.free(fake_bin);
+
+    const r: Mux = .{ .rex = .{ .bin = fake_bin } };
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+
+    try env.put("REX_BLOCK", "block:0");
+    try testing.expectEqual(@as(?bool, true), r.isCurrentSession(testing.allocator, testing.io, &env, "app · login"));
+
+    try env.put("REX_BLOCK", "block:2");
+    try testing.expectEqual(@as(?bool, true), r.isCurrentSession(testing.allocator, testing.io, &env, "app · login"));
+
+    try env.put("REX_BLOCK", "block:1");
+    try testing.expectEqual(@as(?bool, false), r.isCurrentSession(testing.allocator, testing.io, &env, "app · login"));
+
+    try env.put("REX_BLOCK", "block:99");
+    try testing.expectEqual(@as(?bool, false), r.isCurrentSession(testing.allocator, testing.io, &env, "app · login"));
+
+    // A failing `block ls` for a matching session must return null (unknown), not false.
+    try testing.expectEqual(@as(?bool, null), r.isCurrentSession(testing.allocator, testing.io, &env, "app · broken"));
+
+    // A non-existent label returns false without needing block lookups.
+    try testing.expectEqual(@as(?bool, false), r.isCurrentSession(testing.allocator, testing.io, &env, "app · missing"));
 }
 
 test "Mux.storedSessionName folds for tmux and copies for Rex" {
@@ -635,9 +721,9 @@ test "Mux.isCurrentSession distinguishes outside from lookup failure" {
     try testing.expectEqual(@as(?bool, false), t.isCurrentSession(testing.allocator, testing.io, &env, "(app) - wt"));
     try testing.expectEqual(@as(?bool, false), r.isCurrentSession(testing.allocator, testing.io, &env, "app · wt"));
 
-    try env.put("REX_SESSION", "");
+    try env.put("REX_BLOCK", "");
     try testing.expectEqual(@as(?bool, false), r.isCurrentSession(testing.allocator, testing.io, &env, "app · wt"));
 
-    try env.put("REX_SESSION", "session:abc");
+    try env.put("REX_BLOCK", "block:abc");
     try testing.expectEqual(@as(?bool, null), r.isCurrentSession(testing.allocator, testing.io, &env, "app · wt"));
 }
