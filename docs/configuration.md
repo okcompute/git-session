@@ -280,7 +280,7 @@ How the backend is chosen, in order:
 1. The `--multiplexer <rex|tmux>` command-line flag, when passed. It overrides
    `config.toml` and environment detection for that run.
 2. The `multiplexer` key, when set. An unknown value is an error.
-3. Otherwise Rex, when git-session runs in a Rex terminal (`REX_SESSION` is set)
+3. Otherwise Rex, when git-session runs in a Rex terminal (`REX_BLOCK` is set)
    that is not also inside tmux (`TMUX` is unset).
 4. Otherwise tmux.
 

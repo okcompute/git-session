@@ -337,7 +337,7 @@ fn removeRootAndOptionallyContents(
     // is only set up once the user confirms deleting repositories, so that
     // an unusable backend never blocks merely unhooking the root.
     const configured_multiplexer = multiplexer_override orelse cfg.multiplexer;
-    const kind_name = if (mux.chooseKind(configured_multiplexer, env.get("REX_SESSION"), env.get("TMUX"))) |k|
+    const kind_name = if (mux.chooseKind(configured_multiplexer, env.get("REX_BLOCK"), env.get("TMUX"))) |k|
         k.displayName()
     else |_|
         "terminal";

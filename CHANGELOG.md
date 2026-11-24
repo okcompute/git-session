@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Rex backend now detects Rex terminals and identifies the current session via `REX_BLOCK` instead of the removed `REX_SESSION` environment variable (Rex server `0.1.0-preview.23` stopped setting `REX_SESSION`), resolving session membership through `rex block ls` so it works on both older and newer Rex servers.
+
 ## [1.3.0] - 2026-11-20
 
 ### Added

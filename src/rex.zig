@@ -56,6 +56,9 @@ const env_program = "/usr/bin/env";
 /// Shell used when `$SHELL` is not set.
 const fallback_shell = "/bin/sh";
 
+/// Environment variable Rex sets in every terminal to that terminal's block ID.
+pub const block_env_var = "REX_BLOCK";
+
 pub const server_not_running_message =
     "Error: the Rex server is not running. Open the Rex app and try again.\n";
 
@@ -411,11 +414,17 @@ fn freeStringList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void
     list.deinit(allocator);
 }
 
-/// Returns `true` when `current_session_id` (the REX_SESSION of the
-/// terminal git-session runs in) is one of the sessions labelled `label`.
-pub fn isCurrentSession(sessions: []const SessionEntry, current_session_id: []const u8, label: []const u8) bool {
-    for (sessions) |s| {
-        if (std.mem.eql(u8, s.session_id, current_session_id) and std.mem.eql(u8, s.label, label)) return true;
+/// Returns the block ID of the Rex terminal git-session runs in, or `null`
+/// when `REX_BLOCK` is unset or empty.
+pub fn currentBlock(env: *const std.process.Environ.Map) ?[]const u8 {
+    const value = env.get(block_env_var) orelse return null;
+    return if (value.len > 0) value else null;
+}
+
+/// Returns `true` when `block_id` appears in `block_ids`.
+pub fn containsBlock(block_ids: []const []const u8, block_id: []const u8) bool {
+    for (block_ids) |b| {
+        if (std.mem.eql(u8, b, block_id)) return true;
     }
     return false;
 }
@@ -638,21 +647,22 @@ pub const Rex = struct {
         try checkResult(io, r, "do session.select");
     }
 
-    /// When git-session runs inside the session labelled `label` (its
-    /// REX_SESSION is that session) and other sessions exist, asks the Rex
-    /// app to show the next session, so removing the current session does
-    /// not leave the user looking at a session being torn down.
+    /// When git-session runs inside a session labelled `label` (its
+    /// REX_BLOCK belongs to that session) and other sessions exist, asks
+    /// the Rex app to show the next session, so removing the current
+    /// session does not leave the user looking at a session being torn down.
     ///
     /// Unlike tmux, Rex does not report which session the app is showing
-    /// and has no "last session" action, so this keys off REX_SESSION and
+    /// and has no "last session" action, so this keys off REX_BLOCK and
     /// uses "Next Session". Best-effort: failures (e.g. Remote Control
     /// off) are ignored.
     pub fn switchAwayIfCurrent(self: Rex, allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, label: []const u8) void {
-        const current = env.get("REX_SESSION") orelse return;
+        const own_block = currentBlock(env) orelse return;
         const sessions = self.listSessions(allocator, io) catch return;
         defer freeSessions(allocator, sessions);
-        if (!isCurrentSession(sessions, current, label)) return;
         if (sessions.len <= 1) return;
+        const is_current = self.sessionLabelContainsBlock(allocator, io, sessions, label, own_block) catch return;
+        if (!is_current) return;
 
         term.print(io, "Switching to next Rex session.\n", .{});
         const argv = buildNextSessionArgs(allocator, self.bin) catch return;
@@ -660,16 +670,43 @@ pub const Rex = struct {
         self.runIgnoringResult(allocator, io, argv);
     }
 
+    /// Lists the full block IDs of session `session_id`. Caller frees with
+    /// `freeStrings`.
+    pub fn listBlocks(self: Rex, allocator: std.mem.Allocator, io: std.Io, session_id: []const u8) ![][]u8 {
+        const argv = try buildListBlocksArgs(allocator, self.bin, session_id);
+        defer allocator.free(argv);
+        const r = try self.run(allocator, io, argv);
+        defer process.freeExecResult(allocator, r);
+        if (!r.exited_ok) return if (r.exit_code == exit_server_unreachable) error.RexServerNotRunning else error.RexCommandFailed;
+        return parseBlockIds(allocator, r.stdout_data);
+    }
+
+    /// Returns `true` when `block_id` belongs to any session in `sessions`
+    /// labelled `label`. Propagates `listBlocks` errors so callers such as
+    /// `fix --replace` can fail safe instead of assuming `false`.
+    pub fn sessionLabelContainsBlock(
+        self: Rex,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        sessions: []const SessionEntry,
+        label: []const u8,
+        block_id: []const u8,
+    ) !bool {
+        const ids = try idsWithLabel(allocator, sessions, label);
+        defer allocator.free(ids);
+        for (ids) |id| {
+            const blocks = try self.listBlocks(allocator, io, id);
+            defer freeStrings(allocator, blocks);
+            if (containsBlock(blocks, block_id)) return true;
+        }
+        return false;
+    }
+
     /// Returns `true` unless session `session_id` is known to have no
     /// blocks left. Any error counts as "has blocks", so a live session is
     /// never treated as empty.
     pub fn sessionHasBlocks(self: Rex, allocator: std.mem.Allocator, io: std.Io, session_id: []const u8) bool {
-        const argv = buildListBlocksArgs(allocator, self.bin, session_id) catch return true;
-        defer allocator.free(argv);
-        const r = self.run(allocator, io, argv) catch return true;
-        defer process.freeExecResult(allocator, r);
-        if (!r.exited_ok) return true;
-        const blocks = parseBlockIds(allocator, r.stdout_data) catch return true;
+        const blocks = self.listBlocks(allocator, io, session_id) catch return true;
         defer freeStrings(allocator, blocks);
         return blocks.len > 0;
     }
@@ -699,12 +736,10 @@ pub const Rex = struct {
         var all: std.ArrayList([]u8) = .empty;
         errdefer freeStringList(allocator, &all);
         for (ids) |id| {
-            const argv = try buildListBlocksArgs(allocator, self.bin, id);
-            defer allocator.free(argv);
-            const r = try self.run(allocator, io, argv);
-            defer process.freeExecResult(allocator, r);
-            if (!r.exited_ok) continue;
-            const blocks = try parseBlockIds(allocator, r.stdout_data);
+            const blocks = self.listBlocks(allocator, io, id) catch |err| switch (err) {
+                error.RexCommandFailed, error.RexServerNotRunning => continue,
+                else => return err,
+            };
             defer allocator.free(blocks);
             var moved: usize = 0;
             errdefer for (blocks[moved..]) |b| allocator.free(b);
@@ -723,7 +758,7 @@ pub const Rex = struct {
     pub fn stopPanes(self: Rex, allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, label: []const u8) void {
         const blocks = self.blocksOf(allocator, io, label) catch return;
         defer freeStrings(allocator, blocks);
-        const own_block = env.get("REX_BLOCK");
+        const own_block = currentBlock(env);
 
         for (blocks) |block| {
             if (own_block) |own| {
@@ -748,7 +783,7 @@ pub const Rex = struct {
     /// windows), so this polls the block count rather than waiting for the
     /// session to disappear as the tmux backend does.
     pub fn waitForPanesToExit(self: Rex, allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, label: []const u8) void {
-        const own_block = env.get("REX_BLOCK");
+        const own_block = currentBlock(env);
         var attempts: u8 = 0;
         while (attempts < 10) : (attempts += 1) {
             const blocks = self.blocksOf(allocator, io, label) catch return;
@@ -946,18 +981,86 @@ test "idsWithLabel returns every exact match, including duplicates" {
     try testing.expectEqualStrings("session:c", ids[1]);
 }
 
-test "isCurrentSession matches REX_SESSION against the labelled session" {
-    var a_id = "session:a".*;
-    var a_label = "(app) - x".*;
-    var b_id = "session:b".*;
-    var b_label = "other".*;
-    const sessions = [_]SessionEntry{
-        .{ .session_id = &a_id, .label = &a_label },
-        .{ .session_id = &b_id, .label = &b_label },
-    };
-    try testing.expect(isCurrentSession(&sessions, "session:a", "(app) - x"));
-    try testing.expect(!isCurrentSession(&sessions, "session:b", "(app) - x"));
-    try testing.expect(!isCurrentSession(&sessions, "session:z", "(app) - x"));
+test "currentBlock returns non-empty REX_BLOCK and ignores unset or empty values" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testing.expect(currentBlock(&env) == null);
+    try env.put("REX_BLOCK", "");
+    try testing.expect(currentBlock(&env) == null);
+    try env.put("REX_BLOCK", "block:abc");
+    try testing.expectEqualStrings("block:abc", currentBlock(&env).?);
+}
+
+test "containsBlock matches exact block IDs" {
+    const blocks = [_][]const u8{ "block:1", "block:2" };
+    try testing.expect(containsBlock(&blocks, "block:1"));
+    try testing.expect(containsBlock(&blocks, "block:2"));
+    try testing.expect(!containsBlock(&blocks, "block:3"));
+    try testing.expect(!containsBlock(&.{}, "block:1"));
+}
+
+test "Rex.switchAwayIfCurrent switches only when REX_BLOCK is in the target session and others exist" {
+    term.setQuiet(true);
+    defer term.setQuiet(false);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir_path);
+
+    const log_path = try std.fmt.allocPrint(testing.allocator, "{s}/switched", .{dir_path});
+    defer testing.allocator.free(log_path);
+
+    const script = try std.fmt.allocPrint(testing.allocator,
+        \\#!/bin/sh
+        \\if [ "$2" = "ls" ]; then
+        \\  printf '{{"sessions":[{{"session_id":"session:a","label":"app · one"}},{{"session_id":"session:b","label":"app · two"}}]}}\n'
+        \\  exit 0
+        \\fi
+        \\if [ "$2" = "block" ] && [ "$3" = "ls" ]; then
+        \\  case "$5" in
+        \\    session:a) printf '{{"blocks":[{{"block_id":"block:a1"}}]}}\n' ;;
+        \\    session:b) printf '{{"blocks":[{{"block_id":"block:b1"}}]}}\n' ;;
+        \\  esac
+        \\  exit 0
+        \\fi
+        \\if [ "$2" = "do" ] && [ "$3" = "session.next" ]; then
+        \\  printf 'next\n' >> "{s}"
+        \\  exit 0
+        \\fi
+        \\exit 1
+        \\
+    , .{log_path});
+    defer testing.allocator.free(script);
+
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "fake-rex",
+        .data = script,
+        .flags = .{ .permissions = .executable_file },
+    });
+    const fake_bin = try std.fmt.allocPrint(testing.allocator, "{s}/fake-rex", .{dir_path});
+    defer testing.allocator.free(fake_bin);
+
+    const r: Rex = .{ .bin = fake_bin };
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+
+    // Unset REX_BLOCK -> no switch.
+    r.switchAwayIfCurrent(testing.allocator, testing.io, &env, "app · one");
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "switched", .{}));
+
+    // Different session's block -> no switch.
+    try env.put("REX_BLOCK", "block:b1");
+    r.switchAwayIfCurrent(testing.allocator, testing.io, &env, "app · one");
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "switched", .{}));
+
+    // Target session's block -> switches to next session.
+    try env.put("REX_BLOCK", "block:a1");
+    r.switchAwayIfCurrent(testing.allocator, testing.io, &env, "app · one");
+    const log = try tmp.dir.readFileAlloc(testing.io, "switched", testing.allocator, .limited(64));
+    defer testing.allocator.free(log);
+    try testing.expectEqualStrings("next\n", log);
 }
 
 test "parseCreatedSession reads the session and first window IDs" {
